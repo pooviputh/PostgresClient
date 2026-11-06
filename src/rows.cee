@@ -1,0 +1,230 @@
+import encoding.Hex;
+
+struct PgCell {
+    at: usize;
+    /// -1 for NULL.
+    length: i32;
+}
+
+struct PgColumn {
+    nameAt: usize;
+    nameLength: usize;
+    tableOid: u32;
+    columnNumber: i16;
+    typeOid: u32;
+}
+
+/// A query's result: its columns and every row, in text format.
+///
+/// The rows' bytes are kept as the server sent them, in one buffer, with an offset and a length for each cell, so
+/// reading a result allocates per query, not per row or per value. Reading a cell gives a view into that buffer;
+/// the typed getters parse the text where they are called. Rows and columns are numbered from 0; an index out of
+/// range panics. A `PgRows` passed to `queryInto` again is cleared and its buffers are reused.
+@noncopy
+public struct PgRows {
+    private data: Vector<u8>;
+    private cells: Vector<PgCell>;
+    private columns: Vector<PgColumn>;
+    private names: Vector<u8>;
+    private rows: usize;
+    private affected: u64;
+
+    public fn create() -> PgRows => PgRows {
+        data: Vector<u8>.create(),
+        cells: Vector<PgCell>.create(),
+        columns: Vector<PgColumn>.create(),
+        names: Vector<u8>.create(),
+        rows: 0,
+        affected: 0,
+    };
+
+    fn reset(borrow mut this) {
+        this.data.clear();
+        this.cells.clear();
+        this.columns.clear();
+        this.names.clear();
+        this.rows = 0;
+        this.affected = 0;
+    }
+
+    /// The number of rows.
+    public fn rowCount(borrow this) -> usize => this.rows;
+
+    /// The number of columns (0 for a statement that returns no rows).
+    public fn columnCount(borrow this) -> usize => this.columns.length;
+
+    /// The count from the command tag: rows inserted, updated, deleted, selected, copied, fetched or moved; 0 for
+    /// other commands.
+    public fn affectedRows(borrow this) -> u64 => this.affected;
+
+    /// Column `c`'s name, as the server reports it.
+    public fn columnName(borrow this, c: usize) -> StringView {
+        let column = this.columns[c];
+        // The names were validated as UTF-8 when the RowDescription arrived.
+        return StringView.fromUtf8(this.names[column.nameAt..column.nameAt + column.nameLength])!;
+    }
+
+    /// Column `c`'s type OID (see the `OID_` constants).
+    public fn columnType(borrow this, c: usize) -> u32 => this.columns[c].typeOid;
+
+    /// The index of the first column named `name` (compared exactly), or `null`.
+    public fn columnIndex(borrow this, name: StringView) -> usize? {
+        for (c in 0..this.columns.length) {
+            let column = this.columns[c];
+            if (this.columnName(c) == name) {
+                return c;
+            }
+        }
+        return null;
+    }
+
+    fn cell(borrow this, row: usize, c: usize) -> PgCell {
+        if (row >= this.rows || c >= this.columns.length) {
+            return this.cells[this.cells.length]; // out of range: panics with the index
+        }
+        return this.cells[row * this.columns.length + c];
+    }
+
+    /// Whether the value at `row`, column `c` is SQL NULL.
+    public fn isNull(borrow this, row: usize, c: usize) -> bool => this.cell(row, c).length < 0;
+
+    /// The value's bytes as the server sent them (its text form), or `null` for SQL NULL.
+    public fn raw(borrow this, row: usize, c: usize) -> Slice<u8>? {
+        let cell = this.cell(row, c);
+        if (cell.length < 0) {
+            return null;
+        }
+        return this.data[cell.at..cell.at + truncate<usize>(cell.length)];
+    }
+
+    /// The value as text, or `null` for SQL NULL (the server sends UTF-8, as `client_encoding` is set to).
+    public fn text(borrow this, row: usize, c: usize) -> StringView? {
+        let bytes = this.raw(row, c)?;
+        return StringView.fromUtf8(bytes);
+    }
+
+    /// The value as an `i64`, or `null` for SQL NULL or text that is not an integer in range.
+    public fn int64(borrow this, row: usize, c: usize) -> i64? => this.raw(row, c)?.parseInt<i64>();
+
+    /// The value as an `i32`, as `int64`.
+    public fn int32(borrow this, row: usize, c: usize) -> i32? => this.raw(row, c)?.parseInt<i32>();
+
+    /// The value as a `u64`, as `int64`.
+    public fn uint64(borrow this, row: usize, c: usize) -> u64? => this.raw(row, c)?.parseInt<u64>();
+
+    /// The value as an `f64` (`Infinity`, `-Infinity` and `NaN` included), or `null` for SQL NULL or other text.
+    public fn float64(borrow this, row: usize, c: usize) -> f64? => this.raw(row, c)?.parseFloat<f64>();
+
+    /// The value of a `boolean` column, or `null` for SQL NULL or other text.
+    public fn bool(borrow this, row: usize, c: usize) -> bool? {
+        let bytes = this.raw(row, c)?;
+        if (bytes.length == 1 && bytes[0] == 't') {
+            return true;
+        }
+        if (bytes.length == 1 && bytes[0] == 'f') {
+            return false;
+        }
+        return null;
+    }
+
+    /// Appends the bytes of a `bytea` value (sent as `\x` hex) to `out`. False for SQL NULL. Fails with `Protocol` if
+    /// the value is not in hex form (the server's `bytea_output` is `escape`).
+    public fn bytea(borrow this, row: usize, c: usize, out: borrow mut Vector<u8>) -> Result<bool, PgError> {
+        let bytes = match (this.raw(row, c)) {
+            Some(b) => b,
+            null => { return Ok(false); }
+        };
+        if (bytes.length < 2 || bytes[0] != '\\' || bytes[1] != 'x') {
+            return Err(PgError.Protocol);
+        }
+        match (Hex.decode(bytes[2..], out)) {
+            Ok() => { return Ok(true); }
+            Err(_) => { return Err(PgError.Protocol); }
+        }
+    }
+
+    /// Takes a RowDescription body.
+    fn describe(borrow mut this, body: Slice<u8>) -> Result<void, PgError> {
+        if (body.length < 2) {
+            return Err(PgError.Protocol);
+        }
+        let n = body.readBE<u16>(0) as usize;
+        allocated(this.columns.reserve(n))?;
+        var at: usize = 2;
+        for (i in 0..n) {
+            let end = match (body[at..].indexOfByte(0)) {
+                Some(e) => at + e,
+                null => { return Err(PgError.Protocol); }
+            };
+            if (end + 19 > body.length || StringView.fromUtf8(body[at..end]) == null) {
+                return Err(PgError.Protocol);
+            }
+            let nameAt = this.names.length;
+            allocated(this.names.extend(body[at..end]))?;
+            allocated(this.columns.push(PgColumn {
+                nameAt: nameAt,
+                nameLength: end - at,
+                tableOid: body.readBE<u32>(end + 1),
+                columnNumber: body.readBE<i16>(end + 5),
+                typeOid: body.readBE<u32>(end + 7),
+            }))?;
+            at = end + 19; // name NUL, table, column, type, size, modifier, format
+        }
+        return Ok();
+    }
+
+    /// Takes a DataRow body: copies it whole and records where each cell is.
+    fn addRow(borrow mut this, body: Slice<u8>) -> Result<void, PgError> {
+        if (body.length < 2) {
+            return Err(PgError.Protocol);
+        }
+        let n = body.readBE<u16>(0) as usize;
+        if (n != this.columns.length) {
+            return Err(PgError.Protocol);
+        }
+        let base = this.data.length;
+        allocated(this.data.extend(body))?;
+        allocated(this.cells.reserve(n))?;
+        var at: usize = 2;
+        for (i in 0..n) {
+            if (at + 4 > body.length) {
+                return Err(PgError.Protocol);
+            }
+            let length = body.readBE<i32>(at);
+            at += 4;
+            if (length >= 0) {
+                if (truncate<usize>(length) > body.length - at) {
+                    return Err(PgError.Protocol);
+                }
+                allocated(this.cells.push(PgCell { at: base + at, length: length }))?;
+                at += truncate<usize>(length);
+            } else {
+                allocated(this.cells.push(PgCell { at: 0, length: -1 }))?;
+            }
+        }
+        this.rows += 1;
+        return Ok();
+    }
+
+    fn setAffected(borrow mut this, count: u64) {
+        this.affected = count;
+    }
+}
+
+/// The row count at the end of a CommandComplete tag (`INSERT 0 5`, `UPDATE 3`, `SELECT 10`), or 0.
+fn tagCount(tag: Slice<u8>) -> u64 {
+    let end = match (tag.indexOfByte(0)) {
+        Some(e) => e,
+        null => tag.length,
+    };
+    let text = tag[0..end];
+    match (text.lastIndexOf(" ".bytes())) {
+        Some(space) => {
+            match (text[space + 1..].parseInt<u64>()) {
+                Some(n) => { return n; }
+                null => { return 0; }
+            }
+        }
+        null => { return 0; }
+    }
+}

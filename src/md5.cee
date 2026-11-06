@@ -1,0 +1,120 @@
+// MD5 (RFC 1321), for Postgres's legacy `md5` password authentication only. MD5 is broken as a hash: nothing else
+// in this package uses it, and servers should be moved to SCRAM-SHA-256.
+
+const MD5_K: [u32; 64] = [
+    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+];
+
+const MD5_SHIFT: [u32; 64] = [
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+];
+
+fn md5Block(state: borrow mut [u32; 4], block: Slice<u8>) {
+    var m = [0u32; 16];
+    for (i in 0..16) {
+        m[i] = block.readLE<u32>(i * 4);
+    }
+    var a = state[0];
+    var b = state[1];
+    var c = state[2];
+    var d = state[3];
+    for (i in 0..64) {
+        var f: u32 = 0;
+        var g: usize = 0;
+        if (i < 16) {
+            f = (b & c) | ((b ^ 0xFFFFFFFF) & d);
+            g = i;
+        } else if (i < 32) {
+            f = (d & b) | ((d ^ 0xFFFFFFFF) & c);
+            g = (5 * i + 1) % 16;
+        } else if (i < 48) {
+            f = b ^ c ^ d;
+            g = (3 * i + 5) % 16;
+        } else {
+            f = c ^ (b | (d ^ 0xFFFFFFFF));
+            g = (7 * i) % 16;
+        }
+        let rotated = a.wrappingAdd(f).wrappingAdd(MD5_K[i]).wrappingAdd(m[g]).rotateLeft(MD5_SHIFT[i]);
+        a = d;
+        d = c;
+        c = b;
+        b = b.wrappingAdd(rotated);
+    }
+    state[0] = state[0].wrappingAdd(a);
+    state[1] = state[1].wrappingAdd(b);
+    state[2] = state[2].wrappingAdd(c);
+    state[3] = state[3].wrappingAdd(d);
+}
+
+/// The MD5 digest of the concatenation of `first` and `second` (Postgres hashes a secret followed by a salt or a
+/// user name, so this saves joining them).
+fn md5Of(first: Slice<u8>, second: Slice<u8>) -> [u8; 16] {
+    var state: [u32; 4] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
+    var block = [0u8; 64];
+    var used: usize = 0;
+    let total = first.length + second.length;
+    for (part in 0..2) {
+        let data = if (part == 0) first else second;
+        for (byte in data) {
+            block[used] = byte;
+            used += 1;
+            if (used == 64) {
+                let full = block;
+                md5Block(mut state, full[..]);
+                used = 0;
+            }
+        }
+    }
+    block[used] = 0x80;
+    used += 1;
+    if (used > 56) {
+        block[used..].fill(0);
+        let full = block;
+        md5Block(mut state, full[..]);
+        used = 0;
+    }
+    block[used..56].fill(0);
+    block[..].writeLE(56, (total as u64).wrappingMul(8));
+    let last = block;
+    md5Block(mut state, last[..]);
+    var out = [0u8; 16];
+    for (i in 0..4) {
+        out[..].writeLE(i * 4, state[i]);
+    }
+    return out;
+}
+
+const HEX_DIGITS: StringView = "0123456789abcdef";
+
+fn md5Hex(first: Slice<u8>, second: Slice<u8>) -> [u8; 32] {
+    let digest = md5Of(first, second);
+    var out = [0u8; 32];
+    for (i in 0..16) {
+        out[i * 2] = HEX_DIGITS[(digest[i] >> 4) as usize];
+        out[i * 2 + 1] = HEX_DIGITS[(digest[i] & 15) as usize];
+    }
+    return out;
+}
+
+/// The password message for `AuthenticationMD5Password` (protocol §55.3): `"md5"` followed by
+/// `md5hex(md5hex(password ‖ user) ‖ salt)`, 35 bytes.
+fn md5Password(user: Slice<u8>, password: Slice<u8>, salt: Slice<u8>) -> [u8; 35] {
+    let inner = md5Hex(password, user);
+    let outer = md5Hex(inner[..], salt);
+    var out = [0u8; 35];
+    out[0] = 'm';
+    out[1] = 'd';
+    out[2] = '5';
+    out[3..].copyFrom(outer[..]);
+    return out;
+}

@@ -1,0 +1,736 @@
+import encoding.Base64;
+import sha256.HmacSha256;
+import sha256.Sha256;
+import tls.TlsStream;
+
+/// The socket under a connection.
+enum Transport {
+    Plain(AsyncTcpStream),
+    Secure(TlsStream),
+}
+
+/// How much is read from the socket at a time, and the input buffer's starting size.
+const READ_CHUNK: usize = 32 * 1024;
+
+/// Protocol 3.0, and the SSLRequest code (protocol §55.2.10).
+const PROTOCOL_3_0: u32 = 196608;
+const SSL_REQUEST: u32 = 80877103;
+
+/// The largest message this client accepts from a server: 1 GiB is Postgres's own limit for one value.
+const MAX_MESSAGE: usize = 1024 * 1024 * 1024 + 4096;
+
+/// A NOTIFY received on a channel this session LISTENs on.
+@noncopy
+public struct PgNotification {
+    /// The process ID of the notifying session.
+    public pid: u32;
+    public channel: String;
+    public payload: String;
+
+    public fn create() -> PgNotification =>
+        PgNotification { pid: 0, channel: String.create(), payload: String.create() };
+}
+
+/// One session with a Postgres server, over the wire protocol 3.0.
+///
+/// - **Queries** use the extended protocol: the SQL is parsed with `$1`, `$2`, … placeholders and the values travel
+///   separately (`PgParams`), so they are never spliced into SQL. Results come back in text format (`PgRows`).
+/// - **One exchange at a time.** Every operation takes `borrow mut this`. If one is cancelled or fails partway, the
+///   rest of the server's reply is unread, so the connection reports `Broken` from then on and should be dropped.
+/// - **Authentication:** SCRAM-SHA-256 (with the server's signature checked, so a server that does not know the
+///   password cannot pretend to have accepted it), `md5`, and cleartext (sent only over TLS, or when the server
+///   is trusted not to be impersonated).
+@noncopy
+public struct PgConnection {
+    private transport: Transport;
+    /// Received bytes; `[inStart, inEnd)` is not consumed yet.
+    private input: Vector<u8>;
+    private inStart: usize;
+    private inEnd: usize;
+    /// The message `receive` gave last: its type and its body `input[bodyAt..bodyAt + bodyLength]`.
+    private bodyAt: usize;
+    private bodyLength: usize;
+    /// Messages being built, sent together by `send`.
+    private output: Vector<u8>;
+    /// An exchange started and has not reached ReadyForQuery.
+    private busy: bool;
+    /// `I` idle, `T` in a transaction, `E` in a failed transaction.
+    private status: u8;
+    private backendPid: u32;
+    private backendSecret: u32;
+    private error: PgServerError;
+    /// Queued notifications: for each, a 32-bit length then the NotificationResponse body.
+    private notices: Vector<u8>;
+    private noticesAt: usize;
+    private cache: StatementCache;
+
+    /// Connects, negotiates TLS as `config`'s mode says, and authenticates. Every address the host resolves to is
+    /// tried in order.
+    public async fn connect(config: borrow PgConfig) -> Result<PgConnection, PgError> {
+        let addresses = match (await AsyncDns.resolve(config.host(), config.port())) {
+            Ok(a) => a,
+            Err(e) => { return Err(PgError.Io(e)); }
+        };
+        var failure = PgError.Closed;
+        for (address in addresses.view()) {
+            match (await AsyncTcpStream.connectTo(address)) {
+                Ok(tcp) => {
+                    var connection = await PgConnection.start(tcp, config)?;
+                    await connection.startup(config)?;
+                    return Ok(connection);
+                }
+                Err(e) => { failure = PgError.Io(e); }
+            }
+        }
+        return Err(failure);
+    }
+
+    /// Negotiates TLS on a connected socket and makes the connection value.
+    async fn start(tcp: AsyncTcpStream, config: borrow PgConfig) -> Result<PgConnection, PgError> {
+        match (tcp.setNoDelay(true)) {
+            Ok() => {}
+            Err(_) => {}
+        }
+        let mode = config.mode();
+        let wantsTls = match (mode) {
+            SslMode.Disable => false,
+            _ => true,
+        };
+        if (!wantsTls) {
+            return PgConnection.over(Transport.Plain(tcp), config.statements());
+        }
+        var request = [0u8; 8];
+        request[..].writeBE(0, 8u32);
+        request[..].writeBE(4, SSL_REQUEST);
+        match (await tcp.write(request[..])) {
+            Ok() => {}
+            Err(e) => { return Err(PgError.Io(e)); }
+        }
+        // Exactly one byte: anything after it would be unencrypted data injected before the handshake.
+        var answer = [0u8; 1];
+        let n = match (await tcp.read(mut answer[..])) {
+            Ok(n) => n,
+            Err(e) => { return Err(PgError.Io(e)); }
+        };
+        if (n == 0) {
+            return Err(PgError.Closed);
+        }
+        if (answer[0] == 'N') {
+            match (mode) {
+                SslMode.Prefer => { return PgConnection.over(Transport.Plain(tcp), config.statements()); }
+                _ => { return Err(PgError.TlsRefused); }
+            }
+        }
+        if (answer[0] != 'S') {
+            return Err(PgError.Protocol);
+        }
+        let tlsConfig = match (config.tls()) {
+            Some(t) => t,
+            null => { return Err(PgError.Config); }
+        };
+        // verify-ca checks the chain but not the name, so no name is given to check.
+        let name = match (mode) {
+            SslMode.VerifyCa => "",
+            _ => config.host(),
+        };
+        match (await TlsStream.connect(tcp, tlsConfig, name)) {
+            Ok(session) => { return PgConnection.over(Transport.Secure(session), config.statements()); }
+            Err(e) => { return Err(PgError.Tls(e)); }
+        }
+    }
+
+    fn over(transport: Transport, statements: usize) -> Result<PgConnection, PgError> {
+        var input = Vector<u8>.create();
+        allocated(input.resize(READ_CHUNK, 0))?;
+        return Ok(PgConnection {
+            transport: transport,
+            input: input,
+            inStart: 0,
+            inEnd: 0,
+            bodyAt: 0,
+            bodyLength: 0,
+            output: Vector<u8>.create(),
+            busy: true, // until the startup's ReadyForQuery
+            status: 'I',
+            backendPid: 0,
+            backendSecret: 0,
+            error: PgServerError.create(),
+            notices: Vector<u8>.create(),
+            noticesAt: 0,
+            cache: StatementCache.create(statements),
+        });
+    }
+
+    // ---- Sending ----
+
+    /// Starts a message of `kind` in the output; gives where its length goes, for `finish`.
+    fn begin(borrow mut this, kind: u8) -> Result<usize, PgError> {
+        allocated(this.output.pushBE(kind))?;
+        let at = this.output.length;
+        allocated(this.output.pushBE(0u32))?;
+        return Ok(at);
+    }
+
+    /// Writes the length of the message whose length field is at `at`.
+    fn finish(borrow mut this, at: usize) -> Result<void, PgError> {
+        let length = this.output.length - at;
+        if (length > MAX_MESSAGE) {
+            return Err(PgError.TooLarge);
+        }
+        this.output.viewMut().writeBE(at, truncate<u32>(length));
+        return Ok();
+    }
+
+    fn putString(borrow mut this, text: Slice<u8>) -> Result<void, PgError> {
+        if (text.indexOfByte(0) != null) {
+            return Err(PgError.Config); // a NUL would end the string early
+        }
+        allocated(this.output.extend(text))?;
+        return allocated(this.output.pushBE(0u8));
+    }
+
+    /// Sends everything in the output.
+    async fn send(borrow mut this) -> Result<void, PgError> {
+        let out = this.output.view();
+        match (borrow mut this.transport) {
+            Transport.Plain(s) => {
+                match (await s.write(out)) {
+                    Ok() => {}
+                    Err(e) => { return Err(PgError.Io(e)); }
+                }
+            }
+            Transport.Secure(s) => {
+                match (await s.write(out)) {
+                    Ok() => {}
+                    Err(e) => { return Err(PgError.Tls(e)); }
+                }
+            }
+        }
+        this.output.clear();
+        return Ok();
+    }
+
+    // ---- Receiving ----
+
+    /// Reads more bytes from the socket into the input, after making room for `need` unread bytes in all.
+    async fn fill(borrow mut this, need: usize) -> Result<void, PgError> {
+        if (need > MAX_MESSAGE) {
+            return Err(PgError.TooLarge);
+        }
+        if (this.inStart + need > this.input.length || this.inEnd == this.input.length) {
+            // Move the unread bytes to the front; grow if one message is bigger than the buffer.
+            let unread = this.inEnd - this.inStart;
+            if (this.inStart > 0) {
+                let w = this.input.viewMut();
+                for (i in 0..unread) {
+                    w[i] = w[this.inStart + i];
+                }
+                this.inStart = 0;
+                this.inEnd = unread;
+            }
+            if (need > this.input.length || this.inEnd == this.input.length) {
+                let size = if (need > this.input.length) need else this.input.length * 2;
+                allocated(this.input.resize(size, 0))?;
+            }
+        }
+        let room = this.input.viewMut();
+        var n: usize = 0;
+        match (borrow mut this.transport) {
+            Transport.Plain(s) => {
+                match (await s.read(mut room[this.inEnd..])) {
+                    Ok(got) => { n = got; }
+                    Err(e) => { return Err(PgError.Io(e)); }
+                }
+            }
+            Transport.Secure(s) => {
+                match (await s.read(mut room[this.inEnd..])) {
+                    Ok(got) => { n = got; }
+                    Err(e) => { return Err(PgError.Tls(e)); }
+                }
+            }
+        }
+        if (n == 0) {
+            return Err(PgError.Closed);
+        }
+        this.inEnd += n;
+        return Ok();
+    }
+
+    /// Reads the next message: gives its type; its body is `this.body()` until the next `receive`.
+    async fn receive(borrow mut this) -> Result<u8, PgError> {
+        loop {
+            let unread = this.inEnd - this.inStart;
+            if (unread >= 5) {
+                let length = this.input.view().readBE<u32>(this.inStart + 1) as usize;
+                if (length < 4) {
+                    return Err(PgError.Protocol);
+                }
+                if (unread >= length + 1) {
+                    let kind = this.input[this.inStart];
+                    this.bodyAt = this.inStart + 5;
+                    this.bodyLength = length - 4;
+                    this.inStart += length + 1;
+                    return Ok(kind);
+                }
+                await this.fill(length + 1)?;
+            } else {
+                await this.fill(5)?;
+            }
+        }
+    }
+
+    fn body(borrow this) -> Slice<u8> => this.input[this.bodyAt..this.bodyAt + this.bodyLength];
+
+    /// Handles a message that may arrive at any time (protocol §55.2.7). False if `kind` is not one.
+    fn asynchronous(borrow mut this, kind: u8) -> Result<bool, PgError> {
+        if (kind == 'N' || kind == 'S') {
+            return Ok(true); // notices and parameter changes are not kept
+        }
+        if (kind == 'A') {
+            let body = this.input[this.bodyAt..this.bodyAt + this.bodyLength];
+            allocated(this.notices.pushBE(truncate<u32>(body.length)))?;
+            allocated(this.notices.extend(body))?;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+
+    /// Records an ErrorResponse body.
+    fn keepError(borrow mut this) -> Result<void, PgError> {
+        let body = this.input[this.bodyAt..this.bodyAt + this.bodyLength];
+        return this.error.store(body);
+    }
+
+    // ---- Startup and authentication ----
+
+    async fn startup(borrow mut this, config: borrow PgConfig) -> Result<void, PgError> {
+        // The StartupMessage has no type byte.
+        allocated(this.output.pushBE(0u32))?;
+        allocated(this.output.pushBE(PROTOCOL_3_0))?;
+        this.putString("user".bytes())?;
+        this.putString(config.user().bytes())?;
+        this.putString("database".bytes())?;
+        this.putString(config.database().bytes())?;
+        if (config.appName().length > 0) {
+            this.putString("application_name".bytes())?;
+            this.putString(config.appName().bytes())?;
+        }
+        this.putString("client_encoding".bytes())?;
+        this.putString("UTF8".bytes())?;
+        allocated(this.output.pushBE(0u8))?;
+        let length = truncate<u32>(this.output.length);
+        this.output.viewMut().writeBE(0, length);
+        await this.send()?;
+
+        var scram = ScramClient.create();
+        loop {
+            let kind = await this.receive()?;
+            if (kind == 'R') {
+                await this.authenticate(config, mut scram)?;
+            } else if (kind == 'K') {
+                if (this.bodyLength >= 8) {
+                    this.backendPid = this.input.view().readBE<u32>(this.bodyAt);
+                    this.backendSecret = this.input.view().readBE<u32>(this.bodyAt + 4);
+                }
+            } else if (kind == 'Z') {
+                this.readyFor()?;
+                return Ok();
+            } else if (kind == 'E') {
+                this.keepError()?;
+                return Err(PgError.Server);
+            } else if (kind == 'v') {
+                // NegotiateProtocolVersion: the server has an older minor version, which is fine for 3.0.
+            } else if (!this.asynchronous(kind)?) {
+                return Err(PgError.Protocol);
+            }
+        }
+    }
+
+    /// Answers one Authentication message.
+    async fn authenticate(
+        borrow mut this,
+        config: borrow PgConfig,
+        scram: borrow mut ScramClient,
+    ) -> Result<void, PgError> {
+        let body = this.body();
+        if (body.length < 4) {
+            return Err(PgError.Protocol);
+        }
+        let code = body.readBE<u32>(0);
+        if (code == 0) {
+            // AuthenticationOk. After SCRAM began, only a verified server signature may lead here.
+            if (scram.started && !scram.verified) {
+                return Err(PgError.ServerNotAuthenticated);
+            }
+            return Ok();
+        }
+        if (code == 3) {
+            let at = this.begin('p')?;
+            this.putString(config.password().bytes())?;
+            this.finish(at)?;
+            return await this.send();
+        }
+        if (code == 5) {
+            if (body.length < 8) {
+                return Err(PgError.Protocol);
+            }
+            var salt = [0u8; 4];
+            salt[..].copyFrom(body[4..8]);
+            let answer = md5Password(config.user().bytes(), config.password().bytes(), salt[..]);
+            let at = this.begin('p')?;
+            this.putString(answer[..])?;
+            this.finish(at)?;
+            return await this.send();
+        }
+        if (code == 10) {
+            // AuthenticationSASL: a list of mechanism names, each NUL-terminated, then a NUL.
+            if (!hasMechanism(body[4..], "SCRAM-SHA-256".bytes())) {
+                return Err(PgError.UnsupportedAuthentication);
+            }
+            scram.first()?;
+            let at = this.begin('p')?;
+            this.putString("SCRAM-SHA-256".bytes())?;
+            let message = scram.firstMessage();
+            allocated(this.output.pushBE(truncate<i32>(message.length)))?;
+            allocated(this.output.extend(message))?;
+            this.finish(at)?;
+            return await this.send();
+        }
+        if (code == 11) {
+            if (!scram.started) {
+                return Err(PgError.Protocol);
+            }
+            scram.answer(body[4..], config.password().bytes())?;
+            let at = this.begin('p')?;
+            allocated(this.output.extend(scram.finalMessage()))?;
+            this.finish(at)?;
+            return await this.send();
+        }
+        if (code == 12) {
+            if (!scram.started) {
+                return Err(PgError.Protocol);
+            }
+            return scram.verify(body[4..]);
+        }
+        return Err(PgError.UnsupportedAuthentication);
+    }
+
+    fn readyFor(borrow mut this) -> Result<void, PgError> {
+        if (this.bodyLength < 1) {
+            return Err(PgError.Protocol);
+        }
+        this.status = this.input[this.bodyAt];
+        this.busy = false;
+        return Ok();
+    }
+
+    // ---- Queries ----
+
+    /// Begins an exchange: fails if an earlier one was left unfinished.
+    fn claim(borrow mut this) -> Result<void, PgError> {
+        if (this.busy) {
+            return Err(PgError.Broken);
+        }
+        this.busy = true;
+        this.error.clear();
+        this.output.clear();
+        return Ok();
+    }
+
+    /// Queues Parse, Bind, (Describe,) Execute and Sync for `sql` with `params`, all unnamed.
+    fn extended(borrow mut this, sql: StringView, params: borrow PgParams, describe: bool) -> Result<void, PgError> {
+        let types = params.typeList();
+        let formats = params.formatList();
+        // The statement: a cached one, a new one to cache, or the unnamed one (id 0) when the cache is off.
+        var id: u32 = 0;
+        var parse = true;
+        if (this.cache.limit > 0) {
+            match (this.cache.find(sql.bytes(), types)) {
+                Some(found) => {
+                    id = found;
+                    parse = false;
+                }
+                null => { id = this.cache.add(sql.bytes(), types)?; }
+            }
+        }
+        loop {
+            let old = match (this.cache.closing.pop()) {
+                Some(o) => o,
+                null => { break; }
+            };
+            let at = this.begin('C')?;
+            allocated(this.output.pushBE(0x53u8))?; // 'S': a statement
+            this.putName(old)?;
+            this.finish(at)?;
+        }
+        if (parse) {
+            let at = this.begin('P')?;
+            this.putName(id)?;
+            this.putString(sql.bytes())?;
+            allocated(this.output.pushBE(truncate<u16>(types.length)))?;
+            for (oid in types) {
+                allocated(this.output.pushBE(oid))?;
+            }
+            this.finish(at)?;
+        }
+
+        var at = this.begin('B')?;
+        allocated(this.output.pushBE(0u8))?; // the unnamed portal
+        this.putName(id)?;
+        allocated(this.output.pushBE(truncate<u16>(formats.length)))?;
+        for (format in formats) {
+            allocated(this.output.pushBE(format))?;
+        }
+        allocated(this.output.pushBE(truncate<u16>(types.length)))?;
+        allocated(this.output.extend(params.encoded()))?;
+        allocated(this.output.pushBE(0u16))?; // no result format codes: every column in text
+        this.finish(at)?;
+
+        if (describe) {
+            at = this.begin('D')?;
+            allocated(this.output.pushBE(0x50u8))?; // 'P': describe the portal
+            allocated(this.output.pushBE(0u8))?;
+            this.finish(at)?;
+        }
+
+        at = this.begin('E')?;
+        allocated(this.output.pushBE(0u8))?;
+        allocated(this.output.pushBE(0u32))?; // all rows
+        this.finish(at)?;
+
+        at = this.begin('S')?;
+        return this.finish(at);
+    }
+
+    /// Writes statement name `s<id>`, or the unnamed statement for 0, NUL-terminated.
+    fn putName(borrow mut this, id: u32) -> Result<void, PgError> {
+        if (id != 0) {
+            var digits = [0u8; 11];
+            var n = id;
+            var at: usize = 11;
+            while (n > 0) {
+                at -= 1;
+                digits[at] = '0' + truncate<u8>(n % 10);
+                n = n / 10;
+            }
+            allocated(this.output.pushBE(0x73u8))?; // 's'
+            allocated(this.output.extend(digits[at..]))?;
+        }
+        return allocated(this.output.pushBE(0u8));
+    }
+
+    /// Reads replies up to ReadyForQuery. Rows go into `rows` when `keep`; the count of the last command is
+    /// returned. An ErrorResponse is kept for `lastError` and reported as `Server` once the reply is consumed.
+    async fn collect(borrow mut this, rows: borrow mut PgRows, keep: bool) -> Result<u64, PgError> {
+        var failed = false;
+        var count: u64 = 0;
+        loop {
+            let kind = await this.receive()?;
+            if (kind == 'D') {
+                if (keep && !failed) {
+                    let body = this.input[this.bodyAt..this.bodyAt + this.bodyLength];
+                    rows.addRow(body)?;
+                }
+            } else if (kind == 'T') {
+                if (keep) {
+                    let body = this.input[this.bodyAt..this.bodyAt + this.bodyLength];
+                    rows.describe(body)?;
+                }
+            } else if (kind == 'C') {
+                count = tagCount(this.body());
+                rows.setAffected(count);
+            } else if (kind == 'Z') {
+                this.readyFor()?;
+                if (failed) {
+                    return Err(PgError.Server);
+                }
+                return Ok(count);
+            } else if (kind == 'E') {
+                this.keepError()?;
+                failed = true;
+                this.cache.abandon(); // a Parse still pending failed, or was skipped
+                let code = this.error.code();
+                if (code == "0A000" || code == "26000") {
+                    // A cached plan's result type changed (ALTER TABLE), or the statements were discarded.
+                    this.cache.forgetAll()?;
+                }
+            } else if (kind == '1') {
+                this.cache.confirm();
+            } else if (kind == '2' || kind == '3' || kind == 'n' || kind == 'I' || kind == 's') {
+                // BindComplete, CloseComplete, NoData, EmptyQueryResponse, PortalSuspended
+            } else if (!this.asynchronous(kind)?) {
+                return Err(PgError.Protocol);
+            }
+        }
+    }
+
+    /// Runs `sql` with `params` and gives its rows.
+    public async fn query(borrow mut this, sql: StringView, params: borrow PgParams) -> Result<PgRows, PgError> {
+        var rows = PgRows.create();
+        await this.queryInto(sql, params, mut rows)?;
+        return Ok(rows);
+    }
+
+    /// As `query`, into `rows`, which is cleared first; reusing one `PgRows` reuses its memory.
+    public async fn queryInto(
+        borrow mut this,
+        sql: StringView,
+        params: borrow PgParams,
+        rows: borrow mut PgRows,
+    ) -> Result<void, PgError> {
+        this.claim()?;
+        rows.reset();
+        this.extended(sql, params, true)?;
+        await this.send()?;
+        await this.collect(rows, true)?;
+        return Ok();
+    }
+
+    /// Runs `sql` with `params` for its effect, and gives the number of rows it affected. Rows a SELECT returns are
+    /// read and dropped.
+    public async fn execute(borrow mut this, sql: StringView, params: borrow PgParams) -> Result<u64, PgError> {
+        this.claim()?;
+        this.extended(sql, params, false)?;
+        await this.send()?;
+        var none = PgRows.create();
+        return await this.collect(mut none, false);
+    }
+
+    /// Runs one or more `;`-separated statements with the simple query protocol (no parameters), as a migration
+    /// script or `BEGIN`/`COMMIT` need. Gives the count of the last statement; rows are dropped. Statements after
+    /// one that fails are not run.
+    public async fn batch(borrow mut this, sql: StringView) -> Result<u64, PgError> {
+        this.claim()?;
+        let at = this.begin('Q')?;
+        this.putString(sql.bytes())?;
+        this.finish(at)?;
+        await this.send()?;
+        var none = PgRows.create();
+        return await this.collect(mut none, false);
+    }
+
+    // ---- State ----
+
+    /// The fields of the last ErrorResponse, after an operation failed with `PgError.Server`.
+    public fn lastError(borrow this) -> borrow PgServerError => borrow this.error;
+
+    /// Whether the connection can take another operation: not broken by an abandoned one.
+    public fn isReady(borrow this) -> bool => !this.busy;
+
+    /// Whether a transaction is open (`BEGIN` without `COMMIT` or `ROLLBACK` yet).
+    public fn inTransaction(borrow this) -> bool => this.status == 'T' || this.status == 'E';
+
+    /// Whether the open transaction has failed, so only `ROLLBACK` will be accepted.
+    public fn transactionFailed(borrow this) -> bool => this.status == 'E';
+
+    /// The server process serving this session (`pg_backend_pid()`).
+    public fn processId(borrow this) -> u32 => this.backendPid;
+
+    /// Whether the connection is encrypted.
+    public fn isTls(borrow this) -> bool {
+        match (borrow this.transport) {
+            Transport.Plain(_) => { return false; }
+            Transport.Secure(_) => { return true; }
+        }
+    }
+
+    // ---- LISTEN / NOTIFY ----
+
+    /// Moves the oldest queued notification into `into`; false when none is queued. Notifications arrive with the
+    /// replies to other operations, or through `waitForNotification`.
+    public fn takeNotification(borrow mut this, into: borrow mut PgNotification) -> Result<bool, PgError> {
+        if (this.noticesAt >= this.notices.length) {
+            return Ok(false);
+        }
+        let queued = this.notices.view();
+        let length = queued.readBE<u32>(this.noticesAt) as usize;
+        let body = queued[this.noticesAt + 4..this.noticesAt + 4 + length];
+        this.noticesAt += 4 + length;
+        into.channel.clear();
+        into.payload.clear();
+        if (body.length < 6) {
+            return Err(PgError.Protocol);
+        }
+        into.pid = body.readBE<u32>(0);
+        let rest = body[4..];
+        let channelEnd = match (rest.indexOfByte(0)) {
+            Some(e) => e,
+            null => { return Err(PgError.Protocol); }
+        };
+        let payload = rest[channelEnd + 1..];
+        let payloadEnd = match (payload.indexOfByte(0)) {
+            Some(e) => e,
+            null => { return Err(PgError.Protocol); }
+        };
+        match (StringView.fromUtf8(rest[0..channelEnd])) {
+            Some(t) => { allocated(into.channel.append(t))?; }
+            null => { return Err(PgError.Protocol); }
+        }
+        match (StringView.fromUtf8(payload[0..payloadEnd])) {
+            Some(t) => { allocated(into.payload.append(t))?; }
+            null => { return Err(PgError.Protocol); }
+        }
+        if (this.noticesAt >= this.notices.length) {
+            this.notices.clear();
+            this.noticesAt = 0;
+        }
+        return Ok(true);
+    }
+
+    /// Waits until a notification arrives (after `LISTEN channel`), and moves it into `into`. Cancelling the wait
+    /// leaves the connection usable, since no exchange is in progress.
+    public async fn waitForNotification(borrow mut this, into: borrow mut PgNotification) -> Result<void, PgError> {
+        if (this.busy) {
+            return Err(PgError.Broken);
+        }
+        loop {
+            if (this.takeNotification(into)?) {
+                return Ok();
+            }
+            let kind = await this.receive()?;
+            if (kind == 'E') {
+                this.keepError()?;
+                return Err(PgError.Server); // a FATAL error, such as the server shutting down
+            }
+            if (!this.asynchronous(kind)?) {
+                return Err(PgError.Protocol);
+            }
+        }
+    }
+
+    /// Ends the session politely (Terminate, then TLS close_notify). Dropping the connection without it is safe too;
+    /// the server just logs an unexpected EOF.
+    public async fn close(borrow mut this) -> Result<void, PgError> {
+        this.output.clear();
+        let at = this.begin('X')?;
+        this.finish(at)?;
+        await this.send()?;
+        this.busy = true;
+        match (borrow mut this.transport) {
+            Transport.Plain(_) => {}
+            Transport.Secure(s) => {
+                match (await s.shutdown()) {
+                    Ok() => {}
+                    Err(e) => { return Err(PgError.Tls(e)); }
+                }
+            }
+        }
+        return Ok();
+    }
+}
+
+fn hasMechanism(list: Slice<u8>, wanted: Slice<u8>) -> bool {
+    var at: usize = 0;
+    while (at < list.length && list[at] != 0) {
+        let end = match (list[at..].indexOfByte(0)) {
+            Some(e) => at + e,
+            null => { return false; }
+        };
+        let name = list[at..end];
+        if (name.length == wanted.length && name.startsWith(wanted)) {
+            return true;
+        }
+        at = end + 1;
+    }
+    return false;
+}

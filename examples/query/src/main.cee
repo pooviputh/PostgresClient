@@ -1,0 +1,87 @@
+// Runs one SQL statement and prints the rows as tab-separated text, or the server's error.
+// Usage: query <connection string> <sql>
+//   query "postgres://cee:cee_test_pw@127.0.0.1:55432/ceetest?sslmode=prefer" "SELECT now(), version()"
+import postgres.PgConfig;
+import postgres.PgConnection;
+import postgres.PgError;
+import postgres.PgErrors;
+import postgres.PgParams;
+import postgres.PgRows;
+
+async fn say(text: StringView) {
+    match (await AsyncConsole.write(text)) {
+        Ok() => {}
+        Err(_) => {}
+    }
+}
+
+async fn run(config: borrow PgConfig, sql: StringView) -> Result<void, PgError> {
+    var connection = await PgConnection.connect(config)?;
+    let none = PgParams.create();
+    var rows = PgRows.create();
+    match (await connection.queryInto(sql, none, mut rows)) {
+        Ok() => {}
+        Err(e) => {
+            match (e) {
+                PgError.Server => {
+                    let error = connection.lastError();
+                    await say(error.severity());
+                    await say(" ");
+                    await say(error.code());
+                    await say(": ");
+                    await say(error.message());
+                    await say("\n");
+                }
+                _ => {}
+            }
+            return Err(e);
+        }
+    }
+    var line = String.create();
+    for (c in 0..rows.columnCount()) {
+        if (c > 0) {
+            line.append("\t")!;
+        }
+        line.append(rows.columnName(c))!;
+    }
+    line.append("\n")!;
+    for (r in 0..rows.rowCount()) {
+        for (c in 0..rows.columnCount()) {
+            if (c > 0) {
+                line.append("\t")!;
+            }
+            match (rows.text(r, c)) {
+                Some(t) => { line.append(t)!; }
+                null => { line.append("NULL")!; }
+            }
+        }
+        line.append("\n")!;
+    }
+    await say(line.view());
+    await say(if (connection.isTls()) "(TLS)\n" else "(plain)\n");
+    await connection.close()?;
+    return Ok();
+}
+
+fn main() -> i32 {
+    let url = Process.argument(1);
+    let sql = Process.argument(2);
+    if (url == null || sql == null) {
+        Console.writeErrorLine("usage: query <connection string> <sql>");
+        return 2;
+    }
+    let config = match (PgConfig.parse(url!)) {
+        Ok(c) => c,
+        Err(e) => {
+            Console.writeErrorLine(PgErrors.describe(e));
+            return 2;
+        }
+    };
+    match (Async.run(run(config, sql!))) {
+        Ok() => { return 0; }
+        Err(e) => {
+            Console.writeErrorLine(PgErrors.describe(e));
+            return 1;
+        }
+    }
+}

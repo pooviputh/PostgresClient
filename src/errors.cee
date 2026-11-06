@@ -1,0 +1,126 @@
+import tls.TlsError;
+
+/// What went wrong in a Postgres operation.
+public enum PgError {
+    /// The socket failed, or the operation was cancelled or timed out.
+    Io(AsyncError),
+    /// TLS failed: the handshake, the server's certificate, or the session afterwards.
+    Tls(TlsError),
+    OutOfMemory,
+    /// The server asked for TLS to be skipped (`sslmode=require` or stricter), or refused it.
+    TlsRefused,
+    /// The server asked for an authentication method this client does not have (Kerberos, SSPI, or a SASL
+    /// mechanism other than SCRAM-SHA-256), or for a password when the configuration has none.
+    UnsupportedAuthentication,
+    /// The server's SCRAM proof was wrong: it does not know the password, so it is not the server it claims to be.
+    ServerNotAuthenticated,
+    /// The server sent an ErrorResponse; `PgConnection.lastError()` has its fields.
+    Server,
+    /// The server sent something this client did not expect, or a malformed message.
+    Protocol,
+    /// The server closed the connection.
+    Closed,
+    /// An earlier operation on this connection was cancelled or failed partway, so the stream is out of step and the
+    /// connection must be dropped.
+    Broken,
+    /// A connection string or URL could not be read, or a value in it is out of range.
+    Config,
+    /// A query has more parameters than the protocol allows (65535), or a value longer than 2 GiB.
+    TooLarge,
+}
+
+/// Words for `PgError`s.
+public struct PgErrors {
+    /// A short English description of `error`. For `Server`, the server's own message is in `lastError()`.
+    public fn describe(error: PgError) -> StringView {
+        match (error) {
+            PgError.Io(_) => { return "socket error"; }
+            PgError.Tls(_) => { return "TLS error"; }
+            PgError.OutOfMemory => { return "out of memory"; }
+            PgError.TlsRefused => { return "the server does not offer TLS"; }
+            PgError.UnsupportedAuthentication => { return "unsupported authentication method"; }
+            PgError.ServerNotAuthenticated => { return "the server's SCRAM signature is wrong"; }
+            PgError.Server => { return "the server reported an error"; }
+            PgError.Protocol => { return "protocol error"; }
+            PgError.Closed => { return "the server closed the connection"; }
+            PgError.Broken => { return "the connection is out of step after an earlier failure"; }
+            PgError.Config => { return "invalid connection setting"; }
+            PgError.TooLarge => { return "query or value too large"; }
+        }
+    }
+}
+
+fn allocated(outcome: Result<void, AllocError>) -> Result<void, PgError> {
+    match (outcome) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(PgError.OutOfMemory); }
+    }
+}
+
+/// The fields of an ErrorResponse or NoticeResponse (protocol §55.8), kept as the server sent them.
+@noncopy
+public struct PgServerError {
+    private raw: Vector<u8>;
+
+    public fn create() -> PgServerError => PgServerError { raw: Vector<u8>.create() };
+
+    fn store(borrow mut this, body: Slice<u8>) -> Result<void, PgError> {
+        this.raw.clear();
+        return allocated(this.raw.extend(body));
+    }
+
+    fn clear(borrow mut this) {
+        this.raw.clear();
+    }
+
+    /// Whether an error has been recorded.
+    public fn isSet(borrow this) -> bool => this.raw.length > 0;
+
+    /// The field with the one-letter `code` (`'M'` message, `'C'` SQLSTATE, `'D'` detail, `'H'` hint, `'P'` position,
+    /// `'n'` constraint, …), or `null`.
+    public fn field(borrow this, code: u8) -> StringView? {
+        let bytes = this.raw.view();
+        var at: usize = 0;
+        while (at < bytes.length && bytes[at] != 0) {
+            let kind = bytes[at];
+            let rest = bytes[at + 1..];
+            let end = match (rest.indexOfByte(0)) {
+                Some(e) => e,
+                null => { return null; }
+            };
+            if (kind == code) {
+                return StringView.fromUtf8(rest[0..end]);
+            }
+            at += end + 2;
+        }
+        return null;
+    }
+
+    /// The five-character SQLSTATE, such as `23505` (unique_violation), or `""`.
+    public fn code(borrow this) -> StringView {
+        match (this.field('C')) {
+            Some(c) => { return c; }
+            null => { return ""; }
+        }
+    }
+
+    /// The primary message, or `""`.
+    public fn message(borrow this) -> StringView {
+        match (this.field('M')) {
+            Some(m) => { return m; }
+            null => { return ""; }
+        }
+    }
+
+    /// `ERROR`, `FATAL`, `PANIC`, `WARNING`, `NOTICE`, … (untranslated where the server sends it), or `""`.
+    public fn severity(borrow this) -> StringView {
+        match (this.field('V')) {
+            Some(s) => { return s; }
+            null => {}
+        }
+        match (this.field('S')) {
+            Some(s) => { return s; }
+            null => { return ""; }
+        }
+    }
+}

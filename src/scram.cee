@@ -1,0 +1,165 @@
+// SCRAM-SHA-256 (RFC 5802, RFC 7677) as Postgres uses it (protocol §55.3.1): no channel binding (`n,,`), and an
+// empty user name in the messages, since the server takes the user from the StartupMessage.
+//
+// The password is used as given. RFC 7677 asks for SASLprep, which only changes passwords with unusual Unicode
+// (such as non-ASCII spaces or compatibility characters); Postgres itself falls back to the raw bytes when SASLprep
+// fails, so ASCII and ordinary UTF-8 passwords match.
+
+import encoding.Base64;
+import sha256.HmacSha256;
+import sha256.Sha256;
+import sha256.constantTimeEqual;
+import sha256.pbkdf2;
+
+/// Random bytes in the client nonce: 18 gives 24 base64 characters, as libpq's.
+const NONCE_BYTES: usize = 18;
+
+/// The most PBKDF2 rounds accepted from a server, so that a hostile one cannot make the client spin for minutes.
+/// Postgres's default is 4096.
+const MAX_ITERATIONS: u32 = 10000000;
+
+@noncopy
+struct ScramClient {
+    started: bool;
+    verified: bool;
+    /// The client-first message (`n,,n=,r=<nonce>`); its bare part starts after the `n,,`.
+    firstText: Vector<u8>;
+    /// The client-final message (`c=biws,r=<nonce>,p=<proof>`).
+    finalText: Vector<u8>;
+    serverSignature: [u8; 32];
+
+    fn create() -> ScramClient => ScramClient {
+        started: false,
+        verified: false,
+        firstText: Vector<u8>.create(),
+        finalText: Vector<u8>.create(),
+        serverSignature: [0u8; 32],
+    };
+
+    /// Makes the client-first message.
+    fn first(borrow mut this) -> Result<void, PgError> {
+        var random = [0u8; 18];
+        match (Random.fill(mut random[..])) {
+            Ok() => {}
+            Err(_) => { return Err(PgError.UnsupportedAuthentication); }
+        }
+        this.firstText.clear();
+        allocated(this.firstText.extend("n,,n=,r=".bytes()))?;
+        allocated(Base64.encode(random[0..NONCE_BYTES], mut this.firstText))?;
+        this.started = true;
+        return Ok();
+    }
+
+    fn firstMessage(borrow this) -> Slice<u8> => this.firstText.view();
+
+    fn finalMessage(borrow this) -> Slice<u8> => this.finalText.view();
+
+    /// Reads the server-first message and makes the client-final one, with the proof.
+    fn answer(borrow mut this, serverFirst: Slice<u8>, password: Slice<u8>) -> Result<void, PgError> {
+        let first = this.firstText.view();
+        let bare = first[3..];
+        let clientNonce = first[8..];
+        // Offsets of the values in `serverFirst`: r=…,s=…,i=… in that order, then any extensions.
+        var nonceAt: usize = 0;
+        var nonceEnd: usize = 0;
+        var saltAt: usize = 0;
+        var saltEnd: usize = 0;
+        var iterations: u32 = 0;
+        var at: usize = 0;
+        var index = 0;
+        while (at < serverFirst.length) {
+            let end = match (serverFirst[at..].indexOfByte(',')) {
+                Some(e) => at + e,
+                null => serverFirst.length,
+            };
+            if (end - at < 2 || serverFirst[at + 1] != '=') {
+                return Err(PgError.Protocol);
+            }
+            let kind = serverFirst[at];
+            if (kind == 'm') {
+                return Err(PgError.UnsupportedAuthentication); // a mandatory extension (RFC 5802 §5.1)
+            } else if (kind == 'r' && index == 0) {
+                nonceAt = at + 2;
+                nonceEnd = end;
+            } else if (kind == 's' && index == 1) {
+                saltAt = at + 2;
+                saltEnd = end;
+            } else if (kind == 'i' && index == 2) {
+                iterations = match (serverFirst[at + 2..end].parseInt<u32>()) {
+                    Some(n) => n,
+                    null => { return Err(PgError.Protocol); }
+                };
+            }
+            index += 1;
+            at = end + 1;
+        }
+        let serverNonce = serverFirst[nonceAt..nonceEnd];
+        let saltText = serverFirst[saltAt..saltEnd];
+        // The server's nonce must extend ours, or this is a replay or a different exchange.
+        if (serverNonce.length <= clientNonce.length || !serverNonce.startsWith(clientNonce)) {
+            return Err(PgError.Protocol);
+        }
+        if (iterations == 0 || iterations > MAX_ITERATIONS) {
+            return Err(PgError.Protocol);
+        }
+        var salt = Vector<u8>.create();
+        match (Base64.decode(saltText, mut salt)) {
+            Ok() => {}
+            Err(_) => { return Err(PgError.Protocol); }
+        }
+        if (salt.length == 0) {
+            return Err(PgError.Protocol);
+        }
+
+        var salted = [0u8; 32];
+        pbkdf2(password, salt.view(), iterations, mut salted[..]);
+        let clientKey = HmacSha256.mac(salted[..], "Client Key".bytes());
+        let storedKey = Sha256.hash(clientKey[..]);
+        let serverKey = HmacSha256.mac(salted[..], "Server Key".bytes());
+
+        this.finalText.clear();
+        allocated(this.finalText.extend("c=biws,r=".bytes()))?;
+        allocated(this.finalText.extend(serverNonce))?;
+        // AuthMessage = client-first-bare "," server-first "," client-final-without-proof
+        let withoutProof = this.finalText.view();
+        var signer = HmacSha256.create(storedKey[..]);
+        signer.update(bare);
+        signer.update(",".bytes());
+        signer.update(serverFirst);
+        signer.update(",".bytes());
+        signer.update(withoutProof);
+        var serverSigner = HmacSha256.create(serverKey[..]);
+        serverSigner.update(bare);
+        serverSigner.update(",".bytes());
+        serverSigner.update(serverFirst);
+        serverSigner.update(",".bytes());
+        serverSigner.update(withoutProof);
+        let clientSignature = signer.finish();
+        this.serverSignature = serverSigner.finish();
+
+        var proof = [0u8; 32];
+        for (i in 0..32) {
+            proof[i] = clientKey[i] ^ clientSignature[i];
+        }
+        allocated(this.finalText.extend(",p=".bytes()))?;
+        allocated(Base64.encode(proof[..], mut this.finalText))?;
+        return Ok();
+    }
+
+    /// Checks the server-final message's signature.
+    fn verify(borrow mut this, serverFinal: Slice<u8>) -> Result<void, PgError> {
+        if (serverFinal.length < 2 || serverFinal[0] != 'v' || serverFinal[1] != '=') {
+            return Err(PgError.ServerNotAuthenticated);
+        }
+        var signature = Vector<u8>.create();
+        match (Base64.decode(serverFinal[2..], mut signature)) {
+            Ok() => {}
+            Err(_) => { return Err(PgError.ServerNotAuthenticated); }
+        }
+        if (!constantTimeEqual(signature.view(), this.serverSignature[..])) {
+            return Err(PgError.ServerNotAuthenticated);
+        }
+        this.verified = true;
+        return Ok();
+    }
+}

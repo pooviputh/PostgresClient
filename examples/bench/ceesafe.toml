@@ -1,0 +1,6 @@
+[package]
+name = "bench"
+kind = "executable"
+
+[dependencies]
+postgres = { path = "../.." }

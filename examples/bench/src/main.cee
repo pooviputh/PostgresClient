@@ -1,0 +1,66 @@
+// Round trips per second for a small parameterised query, with and without the statement cache.
+// Usage: bench <connection string> [count]
+import postgres.PgConfig;
+import postgres.PgConnection;
+import postgres.PgError;
+import postgres.PgErrors;
+import postgres.PgParams;
+import postgres.PgRows;
+
+async fn run(config: borrow PgConfig, count: u64) -> Result<u64, PgError> {
+    var connection = await PgConnection.connect(config)?;
+    var params = PgParams.create();
+    var rows = PgRows.create();
+    var sum: u64 = 0;
+    for (i in 0..count) {
+        params.clear();
+        params.int64(truncate<i64>(i))?;
+        params.text("alice@example.org")?;
+        await connection.queryInto(
+            "SELECT $1::int8 + 1 AS n, $2::text AS owner, now() AS at WHERE $2 LIKE '%@%'",
+            params,
+            mut rows,
+        )?;
+        sum += rows.uint64(0, 0)!;
+    }
+    await connection.close()?;
+    return Ok(sum);
+}
+
+fn measure(config: borrow PgConfig, count: u64, label: StringView) -> i32 {
+    let start = Clock.unixMillis();
+    match (Async.run(run(config, count))) {
+        Ok(_) => {}
+        Err(e) => {
+            Console.writeErrorLine(PgErrors.describe(e));
+            return 1;
+        }
+    }
+    let ms = Clock.unixMillis() - start;
+    var line = String.create();
+    line.append(label)!;
+    line.appendNumber(count * 1000 / (if (ms <= 0) 1u64 else truncate<u64>(ms)))!;
+    line.append(" queries/s")!;
+    Console.writeLine(line.view());
+    return 0;
+}
+
+fn main() -> i32 {
+    let url = match (Process.argument(1)) {
+        Some(u) => u,
+        null => {
+            Console.writeErrorLine("usage: bench <connection string> [count]");
+            return 2;
+        }
+    };
+    let count: u64 = match (Process.argument(2)) {
+        Some(c) => match (c.parseInt<u64>()) { Some(n) => n, null => 20000 },
+        null => 20000,
+    };
+    var config = PgConfig.parse(url)!;
+    if (measure(config, count, "statement cache on:  ") != 0) {
+        return 1;
+    }
+    config.statementCache(0);
+    return measure(config, count, "statement cache off: ");
+}

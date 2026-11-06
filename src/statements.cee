@@ -1,0 +1,150 @@
+// The prepared-statement cache: each distinct (SQL, parameter types) a connection runs is parsed once as a named
+// statement `s<id>`, then only bound and executed. The server keeps the parse tree and, after a few runs, a generic
+// plan, so a hot query skips parsing and planning entirely.
+
+/// The default number of statements a connection keeps prepared.
+const DEFAULT_STATEMENTS: usize = 128;
+
+@noncopy
+struct CachedStatement {
+    live: bool;
+    hash: u64;
+    id: u32;
+    used: u64;
+    sql: Vector<u8>;
+    types: Vector<u32>;
+}
+
+fn hashOf(sql: Slice<u8>, types: Slice<u32>) -> u64 {
+    var h: u64 = 0xcbf29ce484222325; // FNV-1a
+    for (b in sql) {
+        h = (h ^ (b as u64)).wrappingMul(0x100000001b3);
+    }
+    for (t in types) {
+        h = (h ^ (t as u64)).wrappingMul(0x100000001b3);
+    }
+    return h;
+}
+
+fn sameBytes(a: Slice<u8>, b: Slice<u8>) -> bool => a.length == b.length && a.startsWith(b);
+
+fn sameTypes(a: Slice<u32>, b: Slice<u32>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+@noncopy
+struct StatementCache {
+    entries: Vector<CachedStatement>;
+    limit: usize;
+    nextId: u32;
+    tick: u64;
+    /// Statements to Close on the server, sent with the next exchange.
+    closing: Vector<u32>;
+    /// The slot whose Parse is in flight, confirmed by ParseComplete.
+    pending: usize?;
+
+    fn create(limit: usize) -> StatementCache => StatementCache {
+        entries: Vector<CachedStatement>.create(),
+        limit: limit,
+        nextId: 1,
+        tick: 0,
+        closing: Vector<u32>.create(),
+        pending: null,
+    };
+
+    /// The id of the prepared statement for `sql` and `types`, or `null`.
+    fn find(borrow mut this, sql: Slice<u8>, types: Slice<u32>) -> u32? {
+        let hash = hashOf(sql, types);
+        this.tick += 1;
+        for (i in 0..this.entries.length) {
+            let entry = borrow this.entries[i];
+            if (entry.live && entry.hash == hash && sameBytes(entry.sql.view(), sql) &&
+                sameTypes(entry.types.view(), types)) {
+                let id = entry.id;
+                this.entries[i].used = this.tick;
+                return id;
+            }
+        }
+        return null;
+    }
+
+    /// Takes a slot for a new statement, evicting the least recently used one when full, and gives its id. The
+    /// slot counts once `confirm` is called.
+    fn add(borrow mut this, sql: Slice<u8>, types: Slice<u32>) -> Result<u32, PgError> {
+        var slot = this.entries.length;
+        for (i in 0..this.entries.length) {
+            if (!this.entries[i].live) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot == this.entries.length && this.entries.length >= this.limit) {
+            var oldest: usize = 0;
+            for (i in 1..this.entries.length) {
+                if (this.entries[i].used < this.entries[oldest].used) {
+                    oldest = i;
+                }
+            }
+            allocated(this.closing.push(this.entries[oldest].id))?;
+            this.entries[oldest].live = false;
+            slot = oldest;
+        }
+        if (slot == this.entries.length) {
+            allocated(this.entries.push(CachedStatement {
+                live: false,
+                hash: 0,
+                id: 0,
+                used: 0,
+                sql: Vector<u8>.create(),
+                types: Vector<u32>.create(),
+            }))?;
+        }
+        let id = this.nextId;
+        this.nextId += 1;
+        let entry = borrow mut this.entries[slot];
+        entry.sql.clear();
+        allocated(entry.sql.extend(sql))?;
+        entry.types.clear();
+        allocated(entry.types.extend(types))?;
+        entry.hash = hashOf(sql, types);
+        entry.id = id;
+        entry.used = this.tick;
+        this.pending = slot;
+        return Ok(id);
+    }
+
+    /// The pending Parse succeeded.
+    fn confirm(borrow mut this) {
+        match (this.pending) {
+            Some(slot) => { this.entries[slot].live = true; }
+            null => {}
+        }
+        this.pending = null;
+    }
+
+    /// The pending Parse failed, or never ran: the slot stays free.
+    fn abandon(borrow mut this) {
+        this.pending = null;
+    }
+
+    /// Forgets every statement, closing them on the server with the next exchange: after a schema change made a
+    /// cached plan's result type wrong, or the session's statements were discarded.
+    fn forgetAll(borrow mut this) -> Result<void, PgError> {
+        for (i in 0..this.entries.length) {
+            if (this.entries[i].live) {
+                allocated(this.closing.push(this.entries[i].id))?;
+                this.entries[i].live = false;
+            }
+        }
+        this.pending = null;
+        return Ok();
+    }
+}

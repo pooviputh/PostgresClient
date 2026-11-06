@@ -1,0 +1,746 @@
+// Tests against a real server, set up by tests/setup-docker.sh: Postgres 17 on 127.0.0.1:$PG_TEST_PORT with TLS (the
+// tls package's localhost fixture certificate) and one user per authentication method. Without PG_TEST_PORT
+// they pass without running, so `ceesafec test` works on a machine with no server.
+//
+// Each scenario is an async fn run with `Async.run(...)`: `Async.run(Async.scope(…))` written directly in sync code
+// does not deliver its result in ceesafec 0.15.0 (see CeeSafeLibs/NOTES-ceesafe-0.14.md).
+
+import tls.TlsConfig;
+
+/// A whole file. Test setup, so failure stops the test.
+fn readFile(path: StringView) -> Vector<u8> {
+    var file = File.open(path)!;
+    var out = Vector<u8>.create();
+    var buffer = [0u8; 4096];
+    loop {
+        let n = file.read(mut buffer[..])!;
+        if (n == 0) {
+            break;
+        }
+        out.extend(buffer[0..n])!;
+    }
+    return out;
+}
+
+/// The test server's port, or `null` to skip.
+fn testPort() -> u16? {
+    let text = Environment.variable("PG_TEST_PORT")?;
+    return text.parseInt<u16>();
+}
+
+fn configFor(port: u16, user: StringView, password: StringView, mode: SslMode) -> PgConfig {
+    var config = PgConfig.create("127.0.0.1", user, password, "ceetest")!;
+    config.setPort(port);
+    config.sslMode(mode)!;
+    return config;
+}
+
+fn mainConfig(port: u16) -> PgConfig => configFor(port, "cee", "cee_test_pw", SslMode.Disable);
+
+fn expectServerError(
+    outcome: Result<u64, PgError>,
+    connection: borrow PgConnection,
+    code: StringView,
+) -> Result<void, TestFailure> {
+    match (outcome) {
+        Ok(_) => { return Check.fail("the statement should have failed"); }
+        Err(PgError.Server) => {}
+        Err(_) => { return Check.fail("failed, but not with a server error"); }
+    }
+    return Check.isTrue(connection.lastError().code() == code, code);
+}
+
+/// Connects with `config` and runs `SELECT current_user`, which must be `user`.
+async fn whoAmI(config: borrow PgConfig, user: StringView, secure: borrow mut bool) -> Result<bool, PgError> {
+    var connection = await PgConnection.connect(config)?;
+    let params = PgParams.create();
+    let rows = await connection.query("SELECT current_user", params)?;
+    secure = connection.isTls();
+    let same = rows.text(0, 0)! == user;
+    await connection.close()?;
+    return Ok(same);
+}
+
+fn connectsAs(config: borrow PgConfig, user: StringView, wantTls: bool) -> Result<void, TestFailure> {
+    var secure = false;
+    match (Async.run(whoAmI(config, user, mut secure))) {
+        Ok(same) => { Check.isTrue(same, "current_user")?; }
+        Err(e) => { return Check.fail(PgErrors.describe(e)); }
+    }
+    return Check.isTrue(secure == wantTls, "TLS as expected");
+}
+
+// ── Authentication and TLS ───────────────────────────────────────────────────────────────────────────────────
+
+@test
+fn authenticatesEveryWay() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    connectsAs(mainConfig(port), "cee", false)?; // SCRAM-SHA-256
+    connectsAs(configFor(port, "md5user", "md5_pw", SslMode.Disable), "md5user", false)?;
+    connectsAs(configFor(port, "plainuser", "plain_pw", SslMode.Require), "plainuser", true)?; // cleartext, in TLS
+    return Ok();
+}
+
+async fn tryConnect(config: borrow PgConfig) -> Result<void, PgError> {
+    var connection = await PgConnection.connect(config)?;
+    await connection.close()?;
+    return Ok();
+}
+
+@test
+fn rejectsWrongPassword() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    let users = ["cee", "md5user", "plainuser"];
+    for (user in users) {
+        let config = configFor(port, user, "wrong", SslMode.Prefer);
+        match (Async.run(tryConnect(config))) {
+            Ok() => { return Check.fail("a wrong password was accepted"); }
+            Err(PgError.Server) => {}
+            Err(e) => { return Check.fail(PgErrors.describe(e)); }
+        }
+    }
+    return Ok();
+}
+
+@test
+fn negotiatesTls() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    connectsAs(configFor(port, "tlsonly", "tls_pw", SslMode.Prefer), "tlsonly", true)?;
+    connectsAs(configFor(port, "tlsonly", "tls_pw", SslMode.Require), "tlsonly", true)?;
+    // pg_hba rejects tlsonly without TLS.
+    match (Async.run(tryConnect(configFor(port, "tlsonly", "tls_pw", SslMode.Disable)))) {
+        Ok() => { return Check.fail("tlsonly connected without TLS"); }
+        Err(PgError.Server) => {}
+        Err(e) => { return Check.fail(PgErrors.describe(e)); }
+    }
+    // verify-full with the system roots: the test CA is not among them.
+    match (Async.run(tryConnect(configFor(port, "cee", "cee_test_pw", SslMode.VerifyFull)))) {
+        Ok() => { return Check.fail("an untrusted certificate was accepted"); }
+        Err(PgError.Tls(_)) => {}
+        Err(e) => { return Check.fail(PgErrors.describe(e)); }
+    }
+    // verify-full with the test CA, by name (localhost resolves to ::1 first, where nothing listens) and by address.
+    let ca = readFile("../../CeeSafeLibs/tls/tests/fixtures/ca.pem");
+    for (host in ["localhost", "127.0.0.1"]) {
+        var trusted = TlsConfig.clientWithoutRoots()!;
+        trusted.trustPem(ca.view())!;
+        var config = PgConfig.create(host, "cee", "cee_test_pw", "ceetest")!;
+        config.setPort(port);
+        config.useTls(SslMode.VerifyFull, trusted);
+        connectsAs(config, "cee", true)?;
+    }
+    return Ok();
+}
+
+// ── Queries ──────────────────────────────────────────────────────────────────────────────────────────────────────
+
+async fn typesScenario(config: borrow PgConfig, out: borrow mut PgRows) -> Result<void, PgError> {
+    var connection = await PgConnection.connect(config)?;
+    let none = PgParams.create();
+    await connection.queryInto(
+        "SELECT 42::int AS answer, 'héllo'::text AS greeting, NULL::int AS nothing, true AS yes, 1.5::float8 AS half, '\\xdeadbeef'::bytea AS blob, 'Infinity'::float8 AS big, '-9223372036854775808'::int8 AS lowest",
+        none,
+        out,
+    )?;
+    await connection.close()?;
+    return Ok();
+}
+
+@test
+fn readsTypes() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var rows = PgRows.create();
+    match (Async.run(typesScenario(mainConfig(port), mut rows))) {
+        Ok() => {}
+        Err(e) => { return Check.fail(PgErrors.describe(e)); }
+    }
+    Check.equalU64(1, rows.rowCount() as u64)?;
+    Check.equalU64(8, rows.columnCount() as u64)?;
+    Check.isTrue(rows.columnName(1) == "greeting", "column name")?;
+    Check.equalU64(OID_INT4 as u64, rows.columnType(0) as u64)?;
+    Check.equalU64(OID_BYTEA as u64, rows.columnType(5) as u64)?;
+    Check.isTrue(rows.int32(0, 0)! == 42, "int")?;
+    Check.isTrue(rows.text(0, 1)! == "héllo", "text")?;
+    Check.isTrue(rows.isNull(0, 2) && rows.int32(0, 2) == null, "null")?;
+    Check.isTrue(rows.bool(0, 3)!, "bool")?;
+    Check.isTrue(rows.float64(0, 4)! == 1.5, "float")?;
+    var blob = Vector<u8>.create();
+    Check.isTrue(rows.bytea(0, 5, mut blob)!, "bytea present")?;
+    let expected = [0xDEu8, 0xAD, 0xBE, 0xEF];
+    Check.equalBytes(expected[..], blob.view())?;
+    Check.isTrue(rows.float64(0, 6)! > 1.0e308, "Infinity")?;
+    Check.isTrue(rows.int64(0, 7)! == -9223372036854775807 - 1, "int8 min")?;
+    Check.equalU64(1, rows.affectedRows())?;
+    return Ok();
+}
+
+async fn paramsScenario(config: borrow PgConfig, out: borrow mut PgRows) -> Result<void, PgError> {
+    var connection = await PgConnection.connect(config)?;
+    var params = PgParams.create();
+    params.text("Grüße, 'quoted'; DROP TABLE x; --")?;
+    params.int64(-1234567890123)?;
+    params.int32(7)?;
+    params.float64(0.1)?;
+    params.bool(false)?;
+    let blob = [0u8, 1, 2, 255, 0];
+    params.bytes(blob[..])?;
+    params.sqlNull()?;
+    params.textAs("{\"a\": [1, 2]}", OID_JSONB)?;
+    await connection.queryInto(
+        "SELECT $1::text, $2::int8, $3::int4, $4::float8, $5::bool, $6::bytea, $7::text IS NULL, $8 -> 'a' ->> 1, length($6)",
+        params,
+        out,
+    )?;
+    await connection.close()?;
+    return Ok();
+}
+
+@test
+fn bindsParameters() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var rows = PgRows.create();
+    match (Async.run(paramsScenario(mainConfig(port), mut rows))) {
+        Ok() => {}
+        Err(e) => { return Check.fail(PgErrors.describe(e)); }
+    }
+    Check.isTrue(rows.text(0, 0)! == "Grüße, 'quoted'; DROP TABLE x; --", "text survives as data")?;
+    Check.isTrue(rows.int64(0, 1)! == -1234567890123, "int8")?;
+    Check.isTrue(rows.int32(0, 2)! == 7, "int4")?;
+    Check.isTrue(rows.float64(0, 3)! == 0.1, "float8 exact")?;
+    Check.isTrue(!rows.bool(0, 4)!, "bool")?;
+    var blob = Vector<u8>.create();
+    rows.bytea(0, 5, mut blob)!;
+    let expected = [0u8, 1, 2, 255, 0];
+    Check.equalBytes(expected[..], blob.view())?;
+    Check.isTrue(rows.bool(0, 6)!, "null param")?;
+    Check.isTrue(rows.text(0, 7)! == "2", "jsonb")?;
+    Check.isTrue(rows.int32(0, 8)! == 5, "bytea length")?;
+    return Ok();
+}
+
+async fn writesScenario(config: borrow PgConfig, counts: borrow mut [u64; 4]) -> Result<void, PgError> {
+    var connection = await PgConnection.connect(config)?;
+    await connection.batch(
+        "CREATE TEMP TABLE box (id int PRIMARY KEY, name text NOT NULL); CREATE INDEX ON box (name)",
+    )?;
+    var params = PgParams.create();
+    for (i in 0..3) {
+        params.clear();
+        params.int32(truncate<i32>(i))?;
+        params.text("message")?;
+        counts[0] += await connection.execute("INSERT INTO box (id, name) VALUES ($1, $2)", params)?;
+    }
+    let none = PgParams.create();
+    counts[1] = await connection.execute("UPDATE box SET name = name || '!'", none)?;
+    counts[2] = await connection.execute("SELECT * FROM box", none)?;
+    counts[3] = await connection.execute("DELETE FROM box WHERE id > 0", none)?;
+    await connection.close()?;
+    return Ok();
+}
+
+@test
+fn countsAffectedRows() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var counts = [0u64; 4];
+    match (Async.run(writesScenario(mainConfig(port), mut counts))) {
+        Ok() => {}
+        Err(e) => { return Check.fail(PgErrors.describe(e)); }
+    }
+    Check.equalU64(3, counts[0])?;
+    Check.equalU64(3, counts[1])?;
+    Check.equalU64(3, counts[2])?;
+    return Check.equalU64(2, counts[3]);
+}
+
+// ── Errors and transactions ──────────────────────────────────────────────────────────────────────────────────────
+
+async fn errorsScenario(config: borrow PgConfig, checks: borrow mut Vector<bool>) -> Result<void, PgError> {
+    var connection = await PgConnection.connect(config)?;
+    let none = PgParams.create();
+    // A failing statement, then the connection is usable again.
+    match (await connection.execute("SELECT 1 / 0", none)) {
+        Ok(_) => { allocated(checks.push(false))?; }
+        Err(_) => { allocated(checks.push(connection.lastError().code() == "22012"))?; }
+    }
+    allocated(checks.push(connection.lastError().message() == "division by zero"))?;
+    allocated(checks.push(connection.isReady()))?;
+    let rows = await connection.query("SELECT 2", none)?;
+    allocated(checks.push(rows.int32(0, 0)! == 2))?;
+    // A syntax error is reported at Parse.
+    match (await connection.execute("SELEC 1", none)) {
+        Ok(_) => { allocated(checks.push(false))?; }
+        Err(_) => { allocated(checks.push(connection.lastError().code() == "42601"))?; }
+    }
+    // In a transaction, an error fails it until ROLLBACK.
+    await connection.batch("BEGIN")?;
+    allocated(checks.push(connection.inTransaction() && !connection.transactionFailed()))?;
+    match (await connection.execute("SELECT * FROM no_such_table", none)) {
+        Ok(_) => { allocated(checks.push(false))?; }
+        Err(_) => { allocated(checks.push(connection.lastError().code() == "42P01"))?; }
+    }
+    allocated(checks.push(connection.transactionFailed()))?;
+    match (await connection.execute("SELECT 1", none)) {
+        Ok(_) => { allocated(checks.push(false))?; }
+        Err(_) => { allocated(checks.push(connection.lastError().code() == "25P02"))?; }
+    }
+    await connection.batch("ROLLBACK")?;
+    allocated(checks.push(!connection.inTransaction()))?;
+    // A batch stops at its first failing statement.
+    match (await connection.batch(
+        "CREATE TEMP TABLE t (x int); INSERT INTO t VALUES ('x'); INSERT INTO t VALUES (1)",
+    )) {
+        Ok(_) => { allocated(checks.push(false))?; }
+        Err(_) => { allocated(checks.push(connection.lastError().code() == "22P02"))?; }
+    }
+    // A unique violation names its constraint.
+    await connection.batch("CREATE TEMP TABLE u (x int PRIMARY KEY); INSERT INTO u VALUES (1)")?;
+    match (await connection.execute("INSERT INTO u VALUES (1)", none)) {
+        Ok(_) => { allocated(checks.push(false))?; }
+        Err(_) => {
+            let error = connection.lastError();
+            allocated(checks.push(error.code() == "23505" && error.field('n')! == "u_pkey"))?;
+        }
+    }
+    // A NUL in SQL is refused before anything is sent.
+    match (await connection.execute("SELECT 1\0", none)) {
+        Ok(_) => { allocated(checks.push(false))?; }
+        Err(PgError.Config) => { allocated(checks.push(true))?; }
+        Err(_) => { allocated(checks.push(false))?; }
+    }
+    await connection.close()?;
+    return Ok();
+}
+
+@test
+fn reportsServerErrors() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var checks = Vector<bool>.create();
+    match (Async.run(errorsScenario(mainConfig(port), mut checks))) {
+        Ok() => {}
+        Err(e) => { return Check.fail(PgErrors.describe(e)); }
+    }
+    Check.equalU64(13, checks.length as u64)?;
+    for (i in 0..checks.length) {
+        if (!checks[i]) {
+            var message = String.create();
+            message.append("check ")!;
+            message.appendNumber(i)!;
+            message.append(" failed")!;
+            return Check.fail(message.view());
+        }
+    }
+    return Ok();
+}
+
+// ── Size ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+async fn bulkScenario(config: borrow PgConfig, sums: borrow mut [u64; 3]) -> Result<void, PgError> {
+    var connection = await PgConnection.connect(config)?;
+    var rows = PgRows.create();
+    let none = PgParams.create();
+    await connection.queryInto("SELECT i, md5(i::text) FROM generate_series(1, 200000) AS i", none, mut rows)?;
+    sums[0] = rows.rowCount() as u64;
+    for (r in 0..rows.rowCount()) {
+        sums[1] += rows.uint64(r, 0)!;
+    }
+    // A 5 MB value each way, bigger than any buffer's starting size.
+    var big = String.create();
+    for (i in 0..500000) {
+        allocated(big.append("0123456789"))?;
+    }
+    var params = PgParams.create();
+    params.text(big.view())?;
+    await connection.queryInto("SELECT $1::text || 'x', length($1)", params, mut rows)?;
+    let echoed = rows.text(0, 0)!;
+    if (echoed.length == 5000001 && echoed.startsWith(big.view()) && echoed.endsWith("x")) {
+        sums[2] = rows.uint64(0, 1)!;
+    }
+    await connection.close()?;
+    return Ok();
+}
+
+@test
+fn handlesLargeResults() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var sums = [0u64; 3];
+    for (mode in [SslMode.Disable, SslMode.Require]) {
+        sums = [0u64; 3];
+        match (Async.run(bulkScenario(configFor(port, "cee", "cee_test_pw", mode), mut sums))) {
+            Ok() => {}
+            Err(e) => { return Check.fail(PgErrors.describe(e)); }
+        }
+        Check.equalU64(200000, sums[0])?;
+        Check.equalU64(20000100000, sums[1])?;
+        Check.equalU64(5000000, sums[2])?;
+    }
+    return Ok();
+}
+
+// ── LISTEN / NOTIFY ─────────────────────────────────────────────────────────────────────────────────────────────
+
+async fn notifyScenario(config: borrow PgConfig, got: borrow mut PgNotification) -> Result<void, PgError> {
+    var listener = await PgConnection.connect(config)?;
+    var sender = await PgConnection.connect(config)?;
+    await listener.batch("LISTEN mailbox_changed")?;
+    var params = PgParams.create();
+    params.text("inbox:42")?;
+    await sender.execute("SELECT pg_notify('mailbox_changed', $1)", params)?;
+    await listener.waitForNotification(got)?;
+    if (got.pid != sender.processId()) {
+        got.pid = 0;
+    }
+    await sender.close()?;
+    await listener.close()?;
+    return Ok();
+}
+
+@test
+fn deliversNotifications() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var got = PgNotification.create();
+    match (Async.run(notifyScenario(mainConfig(port), mut got))) {
+        Ok() => {}
+        Err(e) => { return Check.fail(PgErrors.describe(e)); }
+    }
+    Check.isTrue(got.channel.view() == "mailbox_changed", "channel")?;
+    Check.isTrue(got.payload.view() == "inbox:42", "payload")?;
+    return Check.isTrue(got.pid != 0, "sender pid");
+}
+
+// ── Cancellation ────────────────────────────────────────────────────────────────────────────────────────────────
+
+async fn cancelScenario(config: borrow PgConfig, seen: borrow mut [bool; 3]) -> Result<void, PgError> {
+    var connection = await PgConnection.connect(config)?;
+    let none = PgParams.create();
+    let outcome: Result<u64, PgError> = await Async.timeout(
+        100,
+        PgError.Closed,
+        async () => await connection.execute("SELECT pg_sleep(5)", none),
+    );
+    match (outcome) {
+        Ok(_) => {}
+        Err(_) => { seen[0] = true; }
+    }
+    // The reply to the abandoned query is still on its way, so the connection refuses further work.
+    seen[1] = !connection.isReady();
+    match (await connection.execute("SELECT 1", none)) {
+        Ok(_) => {}
+        Err(PgError.Broken) => { seen[2] = true; }
+        Err(_) => {}
+    }
+    return Ok();
+}
+
+@test
+fn abandonedQueryBreaksConnection() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var seen = [false; 3];
+    match (Async.run(cancelScenario(mainConfig(port), mut seen))) {
+        Ok() => {}
+        Err(e) => { return Check.fail(PgErrors.describe(e)); }
+    }
+    Check.isTrue(seen[0], "timed out")?;
+    Check.isTrue(seen[1], "not ready")?;
+    return Check.isTrue(seen[2], "Broken");
+}
+
+// ── Statement cache ─────────────────────────────────────────────────────────────────────────────────────────────
+
+async fn preparedCount(connection: borrow mut PgConnection) -> Result<i64, PgError> {
+    let none = PgParams.create();
+    let rows = await connection.query("SELECT count(*) FROM pg_prepared_statements", none)?;
+    return Ok(rows.int64(0, 0)!);
+}
+
+async fn cacheScenario(config: borrow PgConfig, seen: borrow mut Vector<i64>) -> Result<void, PgError> {
+    var connection = await PgConnection.connect(config)?;
+    var params = PgParams.create();
+    // The same query three times is one statement (the count query is the second).
+    for (i in 0..3) {
+        params.clear();
+        params.int32(truncate<i32>(i))?;
+        await connection.execute("SELECT $1::int + 1", params)?;
+    }
+    allocated(seen.push(await preparedCount(mut connection)?))?; // 2
+    // The same SQL with other parameter types is another statement.
+    params.clear();
+    params.text("5")?;
+    await connection.execute("SELECT $1::int + 1", params)?;
+    allocated(seen.push(await preparedCount(mut connection)?))?; // 3
+    // A statement that fails to parse is not kept, and failing twice does not collide.
+    let none = PgParams.create();
+    for (i in 0..2) {
+        match (await connection.execute("SELEC 1", none)) {
+            Ok(_) => { allocated(seen.push(-1))?; }
+            Err(_) => { allocated(seen.push(if (connection.lastError().code() == "42601") 1 else -1))?; }
+        }
+    }
+    allocated(seen.push(await preparedCount(mut connection)?))?; // 3
+    // After ALTER TABLE changes a cached query's columns, one failure, then it is prepared again.
+    await connection.batch("CREATE TEMP TABLE shape (a int); INSERT INTO shape VALUES (1)")?;
+    await connection.execute("SELECT * FROM shape", none)?;
+    await connection.batch("ALTER TABLE shape ADD COLUMN b int")?;
+    match (await connection.execute("SELECT * FROM shape", none)) {
+        Ok(_) => { allocated(seen.push(0))?; } // newer servers replan silently
+        Err(_) => { allocated(seen.push(if (connection.lastError().code() == "0A000") 0 else -1))?; }
+    }
+    let rows = await connection.query("SELECT * FROM shape", none)?;
+    allocated(seen.push(truncate<i64>(rows.columnCount())))?; // 2
+    // DISCARD ALL drops the server's statements: one failure, then they are prepared again.
+    await connection.batch("DISCARD ALL")?;
+    params.clear();
+    params.int32(1)?;
+    match (await connection.execute("SELECT $1::int + 1", params)) {
+        Ok(_) => { allocated(seen.push(0))?; }
+        Err(_) => { allocated(seen.push(if (connection.lastError().code() == "26000") 0 else -1))?; }
+    }
+    let again = await connection.query("SELECT $1::int + 1", params)?;
+    allocated(seen.push(again.int64(0, 0)!))?; // 2
+    await connection.close()?;
+    return Ok();
+}
+
+@test
+fn cachesStatements() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var seen = Vector<i64>.create();
+    match (Async.run(cacheScenario(mainConfig(port), mut seen))) {
+        Ok() => {}
+        Err(e) => { return Check.fail(PgErrors.describe(e)); }
+    }
+    let expected = [2i64, 3, 1, 1, 3, 0, 2, 0, 2];
+    Check.equalU64(expected.length as u64, seen.length as u64)?;
+    for (i in 0..expected.length) {
+        if (seen[i] != expected[i]) {
+            var message = String.create();
+            message.append("step ")!;
+            message.appendNumber(i)!;
+            message.append(": got ")!;
+            message.appendNumber(seen[i])!;
+            return Check.fail(message.view());
+        }
+    }
+    return Ok();
+}
+
+async fn evictionScenario(config: borrow PgConfig, counts: borrow mut [i64; 2]) -> Result<void, PgError> {
+    var connection = await PgConnection.connect(config)?;
+    let none = PgParams.create();
+    await connection.execute("SELECT 1", none)?;
+    await connection.execute("SELECT 2", none)?;
+    await connection.execute("SELECT 3", none)?;
+    await connection.execute("SELECT 1", none)?;      // evicted, so prepared again
+    counts[0] = await preparedCount(mut connection)?; // never more than the limit
+    await connection.close()?;
+    return Ok();
+}
+
+@test
+fn evictsLeastRecentlyUsed() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var config = mainConfig(port);
+    config.statementCache(2);
+    var counts = [0i64; 2];
+    match (Async.run(evictionScenario(config, mut counts))) {
+        Ok() => {}
+        Err(e) => { return Check.fail(PgErrors.describe(e)); }
+    }
+    return Check.isTrue(counts[0] == 2, "two statements kept");
+}
+
+// ── Pool ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+async fn backendPid(lease: borrow mut PgLease) -> Result<i64, PgError> {
+    let none = PgParams.create();
+    let rows = await lease.connection().query("SELECT pg_backend_pid()", none)?;
+    return Ok(rows.int64(0, 0)!);
+}
+
+/// pids[0..2] the same connection reused; pids[2] after a lease left a transaction open; pids[3] after a discard;
+/// pids[4] after a failed statement, which leaves the connection reusable.
+async fn reuseScenario(config: PgConfig, pids: borrow mut [i64; 5]) -> Result<void, PgError> {
+    let pool = PgPool.create(config, 2)?;
+    {
+        var lease = await pool.acquire()?;
+        pids[0] = await backendPid(mut lease)?;
+    }
+    {
+        var lease = await pool.acquire()?;
+        pids[1] = await backendPid(mut lease)?;
+        await lease.connection().batch("BEGIN")?;
+    }
+    {
+        var lease = await pool.acquire()?;
+        pids[2] = await backendPid(mut lease)?;
+        lease.discard();
+    }
+    {
+        var lease = await pool.acquire()?;
+        pids[3] = await backendPid(mut lease)?;
+        match (await lease.connection().batch("SELECT 1/0")) {
+            Ok(_) => { return Err(PgError.Protocol); }
+            Err(_) => {}
+        }
+    }
+    var lease = await pool.acquire()?;
+    pids[4] = await backendPid(mut lease)?;
+    return Ok();
+}
+
+@test
+fn poolReusesConnections() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var pids = [0i64; 5];
+    match (Async.run(reuseScenario(mainConfig(port), mut pids))) {
+        Ok() => {}
+        Err(e) => { return Check.fail(PgErrors.describe(e)); }
+    }
+    Check.isTrue(pids[0] == pids[1], "reused")?;
+    Check.isTrue(pids[2] != pids[1], "open transaction dropped")?;
+    Check.isTrue(pids[3] != pids[2], "discarded")?;
+    return Check.isTrue(pids[4] == pids[3], "reused after a server error");
+}
+
+@noncopy
+struct PoolLoad {
+    inUse: AtomicUSize;
+    peak: AtomicUSize;
+    done: AtomicUSize;
+}
+
+async fn poolWorker(pool: borrow PgPool, load: borrow PoolLoad) -> Result<void, PgError> {
+    for (i in 0..5) {
+        var lease = await pool.acquire()?;
+        let now = load.inUse.fetchAdd(1) + 1;
+        loop {
+            let peak = load.peak.load();
+            if (now <= peak) {
+                break;
+            }
+            match (load.peak.compareExchange(peak, now)) {
+                Ok(_) => { break; }
+                Err(_) => {}
+            }
+        }
+        var params = PgParams.create();
+        params.int32(truncate<i32>(i))?;
+        await lease.connection().execute("SELECT pg_sleep(0.005), $1::int", params)?;
+        load.inUse.fetchSub(1);
+        load.done.fetchAdd(1);
+    }
+    return Ok();
+}
+
+async fn loadScenario(config: PgConfig, load: borrow PoolLoad, opened: borrow mut i64) -> Result<void, PgError> {
+    let pool = PgPool.create(config, 3)?;
+    await Async.scope(PgError.OutOfMemory, (s) => {
+        for (k in 0..12) {
+            s.spawnSend(async () => await poolWorker(pool, load));
+        }
+    })?;
+    var lease = await pool.acquire()?;
+    let none = PgParams.create();
+    let rows = await lease.connection().query(
+        "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'pool-test'",
+        none,
+    )?;
+    opened = rows.int64(0, 0)!;
+    return Ok();
+}
+
+@test
+fn poolSharesAcrossWorkers() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var config = mainConfig(port);
+    config.applicationName("pool-test")!;
+    let load = PoolLoad { inUse: AtomicUSize.create(0), peak: AtomicUSize.create(0), done: AtomicUSize.create(0) };
+    var opened: i64 = 0;
+    match (Async.runWorkers(4, loadScenario(config, load, mut opened))) {
+        Ok() => {}
+        Err(e) => { return Check.fail(PgErrors.describe(e)); }
+    }
+    Check.isTrue(load.done.load() == 60, "every query ran")?;
+    Check.isTrue(load.peak.load() <= 3, "never more leases than the pool's size")?;
+    Check.isTrue(load.peak.load() >= 2, "leases overlapped")?;
+    return Check.isTrue(opened >= 1 && opened <= 3, "at most 3 connections opened");
+}
+
+async fn leasePid(pool: borrow PgPool) -> Result<i64, PgError> {
+    var lease = await pool.acquire()?;
+    return await backendPid(mut lease);
+}
+
+/// A pool of one whose first acquire is cancelled while it connects: the slot must come back, so later acquires
+/// neither hang nor fail.
+async fn cancelledAcquireScenario(config: PgConfig, got: borrow mut [bool; 3]) -> Result<void, PgError> {
+    let pool = PgPool.create(config, 1)?;
+    for (round in 0..3) {
+        let first: Result<i64, PgError> = await Async.timeout(0, PgError.Closed, async () => await leasePid(pool));
+        match (first) {
+            Ok(_) => {}
+            Err(_) => {}
+        }
+        let second: Result<i64, PgError> = await Async.timeout(5000, PgError.Closed, async () => await leasePid(pool));
+        match (second) {
+            Ok(pid) => { got[round] = pid > 0; }
+            Err(e) => { return Err(e); }
+        }
+    }
+    return Ok();
+}
+
+@test
+fn poolSurvivesCancelledAcquire() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var got = [false; 3];
+    match (Async.run(cancelledAcquireScenario(configFor(port, "cee", "cee_test_pw", SslMode.Require), mut got))) {
+        Ok() => {}
+        Err(e) => { return Check.fail(PgErrors.describe(e)); }
+    }
+    return Check.isTrue(got[0] && got[1] && got[2], "the slot came back each time");
+}

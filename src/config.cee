@@ -1,0 +1,441 @@
+import encoding.Hex;
+import tls.TlsConfig;
+
+/// Whether and how a connection uses TLS, as libpq's `sslmode`.
+public enum SslMode {
+    /// Plain TCP only.
+    Disable,
+    /// TLS if the server offers it, without checking its certificate (libpq's default). Protects against passive
+    /// eavesdropping only.
+    Prefer,
+    /// TLS always, without checking the certificate.
+    Require,
+    /// TLS always, with the certificate chain checked against the trusted roots, but not the host name.
+    VerifyCa,
+    /// TLS always, with the chain and the host name checked. The right choice across any untrusted network.
+    VerifyFull,
+}
+
+/// Where and how to connect. Build one with `create` or `parse`, then share it: `PgConnection.connect` only borrows
+/// it, and its TLS configuration (with the trusted roots already loaded) serves every connection.
+@noncopy
+public struct PgConfig {
+    private hostName: String;
+    private portNumber: u16;
+    private databaseName: String;
+    private userName: String;
+    private secret: String;
+    private application: String;
+    private ssl: SslMode;
+    private tlsConfig: TlsConfig?;
+    private statementLimit: usize;
+
+    /// A configuration for `user` on `host`:5432, database `database`, with `sslmode=prefer`.
+    public fn create(
+        host: StringView,
+        user: StringView,
+        password: StringView,
+        database: StringView,
+    ) -> Result<PgConfig, PgError> {
+        var config = PgConfig.empty();
+        allocated(config.hostName.append(host))?;
+        allocated(config.userName.append(user))?;
+        allocated(config.secret.append(password))?;
+        allocated(config.databaseName.append(database))?;
+        config.sslMode(SslMode.Prefer)?;
+        return Ok(config);
+    }
+
+    fn empty() -> PgConfig => PgConfig {
+        hostName: String.create(),
+        portNumber: 5432,
+        databaseName: String.create(),
+        userName: String.create(),
+        secret: String.create(),
+        application: String.create(),
+        ssl: SslMode.Disable,
+        tlsConfig: null,
+        statementLimit: DEFAULT_STATEMENTS,
+    };
+
+    /// Reads a connection string in any of the three usual forms:
+    ///
+    /// - a URL: `postgres://user:password@host:5432/database?sslmode=require&application_name=mail`
+    ///   (`postgresql://` too; percent-escapes are decoded);
+    /// - libpq keywords: `host=db port=5432 dbname=mail user=mail password=secret sslmode=verify-full`;
+    /// - ADO.NET style: `Host=db;Port=5432;Database=mail;Username=mail;Password=secret;SSL Mode=Require`.
+    ///
+    /// Keys are case-insensitive. The known ones are `host`/`server`, `port`, `dbname`/`database`,
+    /// `user`/`username`/`user id`, `password`, `sslmode`/`ssl mode` and `application_name`/`application name`;
+    /// others are ignored. The database defaults to the user name, and `sslmode` to `prefer`.
+    public fn parse(text: StringView) -> Result<PgConfig, PgError> {
+        var config = PgConfig.empty();
+        var mode = SslMode.Prefer;
+        let trimmed = text.trim();
+        if (trimmed.startsWith("postgres://") || trimmed.startsWith("postgresql://")) {
+            mode = config.readUrl(trimmed)?;
+        } else {
+            mode = config.readKeywords(trimmed)?;
+        }
+        if (config.hostName.length == 0) {
+            allocated(config.hostName.append("localhost"))?;
+        }
+        if (config.userName.length == 0) {
+            return Err(PgError.Config);
+        }
+        if (config.databaseName.length == 0) {
+            let user = config.userName.view();
+            var copy = String.create();
+            allocated(copy.append(user))?;
+            config.databaseName = copy;
+        }
+        config.sslMode(mode)?;
+        return Ok(config);
+    }
+
+    fn readUrl(borrow mut this, url: StringView) -> Result<SslMode, PgError> {
+        var mode = SslMode.Prefer;
+        // Byte offsets into `url`: [lo, hi) is the authority (credentials and host) once the scheme, path and query
+        // are taken off.
+        var lo = match (url.indexOf("://")) {
+            Some(i) => i + 3,
+            null => { return Err(PgError.Config); }
+        };
+        var hi = url.length;
+        var queryAt = url.length;
+        match (url[lo..].indexOfByte('?')) {
+            Some(q) => {
+                queryAt = lo + q + 1;
+                hi = lo + q;
+            }
+            null => {}
+        }
+        var pathAt = hi;
+        match (url[lo..hi].indexOfByte('/')) {
+            Some(p) => {
+                pathAt = lo + p + 1;
+                hi = lo + p;
+            }
+            null => {}
+        }
+        match (url[lo..hi].lastIndexOf("@")) {
+            Some(at) => {
+                let credentials = url[lo..lo + at];
+                lo = lo + at + 1;
+                match (credentials.splitOnce(":")) {
+                    Some(halves) => {
+                        percentDecode(halves.left, mut this.userName)?;
+                        percentDecode(halves.right, mut this.secret)?;
+                    }
+                    null => { percentDecode(credentials, mut this.userName)?; }
+                }
+            }
+            null => {}
+        }
+        // The host: `[v6]:port`, `name:port`, or either without the port.
+        var hostLo = lo;
+        var hostHi = hi;
+        var portLo = hi;
+        if (url[lo..hi].startsWith("[")) {
+            let close = match (url[lo..hi].indexOfByte(']')) {
+                Some(c) => lo + c,
+                null => { return Err(PgError.Config); }
+            };
+            hostLo = lo + 1;
+            hostHi = close;
+            if (close + 1 < hi) {
+                if (url[close + 1] != ':') {
+                    return Err(PgError.Config);
+                }
+                portLo = close + 2;
+            }
+        } else {
+            match (url[lo..hi].lastIndexOf(":")) {
+                Some(c) => {
+                    hostHi = lo + c;
+                    portLo = lo + c + 1;
+                }
+                null => {}
+            }
+        }
+        percentDecode(url[hostLo..hostHi], mut this.hostName)?;
+        if (portLo < hi) {
+            this.portNumber = parsePort(url[portLo..hi])?;
+        }
+        let pathEnd = if (queryAt < url.length) queryAt - 1 else url.length;
+        if (pathAt < pathEnd) {
+            percentDecode(url[pathAt..pathEnd], mut this.databaseName)?;
+        }
+        var pairs = url[queryAt..].split("&");
+        loop {
+            let pair = match (pairs.next()) {
+                Some(p) => p,
+                null => { break; }
+            };
+            match (pair.splitOnce("=")) {
+                Some(kv) => {
+                    var value = String.create();
+                    percentDecode(kv.right, mut value)?;
+                    match (this.setting(kv.left, value.view())?) {
+                        Some(m) => { mode = m; }
+                        null => {}
+                    }
+                }
+                null => {}
+            }
+        }
+        return Ok(mode);
+    }
+
+    fn readKeywords(borrow mut this, text: StringView) -> Result<SslMode, PgError> {
+        if (text.contains(";")) {
+            return this.readAdo(text);
+        }
+        // libpq: `key = value` pairs separated by whitespace; a value may be single-quoted, with \' and \\ escapes.
+        var mode = SslMode.Prefer;
+        var at: usize = 0;
+        var value = Vector<u8>.create();
+        while (true) {
+            while (at < text.length && isBlank(text[at])) {
+                at += 1;
+            }
+            if (at >= text.length) {
+                break;
+            }
+            let keyAt = at;
+            while (at < text.length && text[at] != '=' && !isBlank(text[at])) {
+                at += 1;
+            }
+            let keyEnd = at;
+            while (at < text.length && isBlank(text[at])) {
+                at += 1;
+            }
+            if (at >= text.length || text[at] != '=' || keyEnd == keyAt) {
+                return Err(PgError.Config);
+            }
+            at += 1;
+            while (at < text.length && isBlank(text[at])) {
+                at += 1;
+            }
+            value.clear();
+            if (at < text.length && text[at] == '\'') {
+                at += 1;
+                var closed = false;
+                while (at < text.length) {
+                    let c = text[at];
+                    if (c == '\\' && at + 1 < text.length) {
+                        allocated(value.push(text[at + 1]))?;
+                        at += 2;
+                    } else if (c == '\'') {
+                        at += 1;
+                        closed = true;
+                        break;
+                    } else {
+                        allocated(value.push(c))?;
+                        at += 1;
+                    }
+                }
+                if (!closed) {
+                    return Err(PgError.Config);
+                }
+            } else {
+                while (at < text.length && !isBlank(text[at])) {
+                    allocated(value.push(text[at]))?;
+                    at += 1;
+                }
+            }
+            let decoded = match (StringView.fromUtf8(value.view())) {
+                Some(v) => v,
+                null => { return Err(PgError.Config); }
+            };
+            match (this.setting(text[keyAt..keyEnd], decoded)?) {
+                Some(m) => { mode = m; }
+                null => {}
+            }
+        }
+        return Ok(mode);
+    }
+
+    fn readAdo(borrow mut this, text: StringView) -> Result<SslMode, PgError> {
+        // ADO.NET: `Key=Value` pairs separated by ';'; keys may contain spaces.
+        var mode = SslMode.Prefer;
+        var pairs = text.split(";");
+        loop {
+            let pair = match (pairs.next()) {
+                Some(p) => p.trim(),
+                null => { break; }
+            };
+            if (pair.length == 0) {
+                continue;
+            }
+            match (pair.splitOnce("=")) {
+                Some(kv) => {
+                    match (this.setting(kv.left.trim(), unquote(kv.right.trim()))?) {
+                        Some(m) => { mode = m; }
+                        null => {}
+                    }
+                }
+                null => { return Err(PgError.Config); }
+            }
+        }
+        return Ok(mode);
+    }
+
+    /// Applies one key/value; gives the SSL mode when the key was one.
+    fn setting(borrow mut this, key: StringView, value: StringView) -> Result<SslMode?, PgError> {
+        if (key.equalsIgnoreAsciiCase("host") || key.equalsIgnoreAsciiCase("server")) {
+            this.hostName.clear();
+            allocated(this.hostName.append(value))?;
+        } else if (key.equalsIgnoreAsciiCase("port")) {
+            this.portNumber = parsePort(value)?;
+        } else if (key.equalsIgnoreAsciiCase("dbname") || key.equalsIgnoreAsciiCase("database")) {
+            this.databaseName.clear();
+            allocated(this.databaseName.append(value))?;
+        } else if (key.equalsIgnoreAsciiCase("user") || key.equalsIgnoreAsciiCase("username") ||
+            key.equalsIgnoreAsciiCase("user id")) {
+            this.userName.clear();
+            allocated(this.userName.append(value))?;
+        } else if (key.equalsIgnoreAsciiCase("password")) {
+            this.secret.clear();
+            allocated(this.secret.append(value))?;
+        } else if (key.equalsIgnoreAsciiCase("application_name") || key.equalsIgnoreAsciiCase("application name")) {
+            this.application.clear();
+            allocated(this.application.append(value))?;
+        } else if (key.equalsIgnoreAsciiCase("sslmode") || key.equalsIgnoreAsciiCase("ssl mode")) {
+            return Ok(parseSslMode(value)?);
+        }
+        return Ok(null);
+    }
+
+    /// Sets the TLS mode. Every mode but `Disable` loads the system's trusted roots once, here.
+    public fn sslMode(borrow mut this, mode: SslMode) -> Result<void, PgError> {
+        this.ssl = mode;
+        match (mode) {
+            SslMode.Disable => {
+                this.tlsConfig = null;
+                return Ok();
+            }
+            _ => {}
+        }
+        var config = match (TlsConfig.client()) {
+            Ok(c) => c,
+            Err(e) => { return Err(PgError.Tls(e)); }
+        };
+        match (mode) {
+            SslMode.Prefer => { config.verifyPeer(false); }
+            SslMode.Require => { config.verifyPeer(false); }
+            _ => {}
+        }
+        this.tlsConfig = config;
+        return Ok();
+    }
+
+    /// Uses `config` for TLS instead of the one `sslMode` made: for a private CA (`trustPem`), a client
+    /// certificate (`useCertificate`), or `minVersion`. The mode decides whether TLS is required and whether the
+    /// host name is checked; `config` decides whether the chain is.
+    public fn useTls(borrow mut this, mode: SslMode, config: TlsConfig) {
+        this.ssl = mode;
+        this.tlsConfig = config;
+    }
+
+    /// How many prepared statements each connection keeps (128 by default). 0 turns the cache off, so every query
+    /// is parsed afresh as the unnamed statement: needed behind a pooler in transaction mode (PgBouncer before 1.21),
+    /// where consecutive queries may reach different server sessions.
+    public fn statementCache(borrow mut this, size: usize) {
+        this.statementLimit = size;
+    }
+
+    fn statements(borrow this) -> usize => this.statementLimit;
+
+    /// Sets the port.
+    public fn setPort(borrow mut this, port: u16) {
+        this.portNumber = port;
+    }
+
+    /// Sets `application_name`, which the server shows in `pg_stat_activity` and its logs.
+    public fn applicationName(borrow mut this, name: StringView) -> Result<void, PgError> {
+        this.application.clear();
+        return allocated(this.application.append(name));
+    }
+
+    public fn host(borrow this) -> StringView => this.hostName.view();
+    public fn port(borrow this) -> u16 => this.portNumber;
+    public fn database(borrow this) -> StringView => this.databaseName.view();
+    public fn user(borrow this) -> StringView => this.userName.view();
+    fn password(borrow this) -> StringView => this.secret.view();
+    fn appName(borrow this) -> StringView => this.application.view();
+    public fn mode(borrow this) -> SslMode => this.ssl;
+    fn tls(borrow this) -> borrow (TlsConfig?) => borrow this.tlsConfig;
+}
+
+fn isBlank(c: u8) -> bool => c == ' ' || c == '\t' || c == '\n' || c == '\r';
+
+/// `value` without one pair of surrounding single quotes, as libpq allows.
+fn unquote(value: StringView) -> StringView {
+    if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
+        return value[1..value.length - 1];
+    }
+    return value;
+}
+
+fn parsePort(text: StringView) -> Result<u16, PgError> {
+    match (text.parseInt<u16>()) {
+        Some(p) => {
+            if (p == 0) {
+                return Err(PgError.Config);
+            }
+            return Ok(p);
+        }
+        null => { return Err(PgError.Config); }
+    }
+}
+
+fn parseSslMode(value: StringView) -> Result<SslMode, PgError> {
+    if (value.equalsIgnoreAsciiCase("disable")) {
+        return Ok(SslMode.Disable);
+    }
+    if (value.equalsIgnoreAsciiCase("allow") || value.equalsIgnoreAsciiCase("prefer")) {
+        return Ok(SslMode.Prefer);
+    }
+    if (value.equalsIgnoreAsciiCase("require")) {
+        return Ok(SslMode.Require);
+    }
+    if (value.equalsIgnoreAsciiCase("verify-ca") || value.equalsIgnoreAsciiCase("verifyca")) {
+        return Ok(SslMode.VerifyCa);
+    }
+    if (value.equalsIgnoreAsciiCase("verify-full") || value.equalsIgnoreAsciiCase("verifyfull")) {
+        return Ok(SslMode.VerifyFull);
+    }
+    return Err(PgError.Config);
+}
+
+/// Appends `text` to `out` with `%XX` escapes decoded; the result must be UTF-8.
+fn percentDecode(text: StringView, out: borrow mut String) -> Result<void, PgError> {
+    if (text.indexOfByte('%') == null) {
+        return allocated(out.append(text));
+    }
+    var bytes = Vector<u8>.create();
+    var i: usize = 0;
+    while (i < text.length) {
+        let c = text[i];
+        if (c == '%') {
+            if (i + 2 >= text.length) {
+                return Err(PgError.Config);
+            }
+            let hi = Hex.digit(text[i + 1]);
+            let lo = Hex.digit(text[i + 2]);
+            if (hi == null || lo == null) {
+                return Err(PgError.Config);
+            }
+            allocated(bytes.push(hi! * 16 + lo!))?;
+            i += 3;
+        } else {
+            allocated(bytes.push(c))?;
+            i += 1;
+        }
+    }
+    match (StringView.fromUtf8(bytes.view())) {
+        Some(decoded) => { return allocated(out.append(decoded)); }
+        null => { return Err(PgError.Config); }
+    }
+}

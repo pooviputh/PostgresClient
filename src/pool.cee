@@ -1,0 +1,169 @@
+// A connection pool. Its slots travel through one channel: a slot is either an idle connection or a permit to open
+// one, and `max` slots exist in all, so the channel never fills and at most `max` connections are open.
+//
+// A slot is taken from the channel, or, while some were never handed out, made fresh; when neither is possible the
+// task parks on the channel until a lease ends. A lease's drop puts its slot back without waiting, keeping the
+// connection only if it is reusable.
+
+/// The default most connections a pool opens.
+const DEFAULT_POOL_SIZE: usize = 10;
+/// The default time a connection may sit idle before the pool replaces it, in milliseconds.
+const DEFAULT_IDLE_MILLIS: i64 = 5 * 60 * 1000;
+/// The default time a connection is reused for, in milliseconds.
+const DEFAULT_LIFETIME_MILLIS: i64 = 60 * 60 * 1000;
+
+/// An idle connection with its times, or a permit to open one (no connection).
+@noncopy
+struct PoolSlot {
+    /// At most one connection: a vector so that a lease's drop can take it out with `pop`.
+    connection: Vector<PgConnection>;
+    opened: i64;
+    used: i64;
+}
+
+fn emptySlot() -> PoolSlot => PoolSlot { connection: Vector<PgConnection>.create(), opened: 0, used: 0 };
+
+/// A pool of connections to one server, shared by every task of a program, on any worker.
+///
+/// ```ceesafe
+/// let pool = PgPool.create(config, 16)?;
+/// var lease = await pool.acquire()?;
+/// let rows = await lease.connection().query("SELECT 1", params)?;
+/// ```                                   // the lease's drop returns the connection
+///
+/// A connection goes back into the pool when its lease ends, unless it cannot be reused safely:
+/// - an operation on it failed partway or was cancelled (`isReady()` is false);
+/// - a transaction is still open on it;
+/// - it is older than the pool's lifetime.
+/// Such a connection is dropped and its slot reopened on demand. A connection idle longer than the idle limit is
+/// replaced when next taken. Session state other than transactions (`SET`, `LISTEN`, temporary tables) stays with
+/// the connection: use `SET LOCAL`, or a connection of your own for `LISTEN`.
+@noncopy
+public struct PgPool {
+    private settings: PgConfig;
+    private slots: Channel<PoolSlot>;
+    /// Slots never handed out yet.
+    private unissued: AtomicUSize;
+    private max: usize;
+    private idleMillis: i64;
+    private lifetimeMillis: i64;
+
+    /// A pool opening at most `max` connections (at least 1) with `config`. Connections are opened as needed.
+    public fn create(config: PgConfig, max: usize) -> Result<PgPool, PgError> {
+        let size = if (max == 0) 1 else max;
+        let slots = match (Channel<PoolSlot>.create(size)) {
+            Ok(c) => c,
+            Err(_) => { return Err(PgError.OutOfMemory); }
+        };
+        return Ok(PgPool {
+            settings: config,
+            slots: slots,
+            unissued: AtomicUSize.create(size),
+            max: size,
+            idleMillis: DEFAULT_IDLE_MILLIS,
+            lifetimeMillis: DEFAULT_LIFETIME_MILLIS,
+        });
+    }
+
+    /// A pool of the default size, 10.
+    public fn withDefaults(config: PgConfig) -> Result<PgPool, PgError> => PgPool.create(config, DEFAULT_POOL_SIZE);
+
+    /// Replaces connections idle longer than `millis` when they are next taken (0: never).
+    public fn idleLimit(borrow mut this, millis: i64) {
+        this.idleMillis = millis;
+    }
+
+    /// Closes connections once they are `millis` old, when their lease ends (0: never).
+    public fn lifetime(borrow mut this, millis: i64) {
+        this.lifetimeMillis = millis;
+    }
+
+    /// The most connections the pool opens.
+    public fn size(borrow this) -> usize => this.max;
+
+    /// The configuration connections are opened with.
+    public fn config(borrow this) -> borrow PgConfig => borrow this.settings;
+
+    /// Waits for a connection, opening one when the pool has room. A failed connect gives its error and frees the
+    /// slot. Cancelling the wait takes nothing.
+    public async fn acquire(borrow this) -> Result<PgLease, PgError> {
+        var slot = match (this.slots.tryRecv()) {
+            Some(s) => s,
+            null => match (this.issue()) {
+                Some(s) => s,
+                null => match (await this.slots.recvAsync()) {
+                    Ok(Some(s)) => s,
+                    Ok(null) => { return Err(PgError.Closed); }
+                    Err(e) => { return Err(PgError.Io(e)); }
+                },
+            },
+        };
+        let now = Clock.unixMillis();
+        if (slot.connection.length > 0 && this.idleMillis > 0 && now - slot.used > this.idleMillis) {
+            slot.connection.clear(); // the server or a middlebox may have dropped it meanwhile
+        }
+        // The lease owns the slot from here, so a failed or cancelled connect gives it back through the drop.
+        var lease = PgLease { slot: slot, home: this.slots.clone(), lifetimeMillis: this.lifetimeMillis };
+        if (lease.slot.connection.length == 0) {
+            let connection = await PgConnection.connect(borrow this.settings)?;
+            allocated(lease.slot.connection.push(connection))?;
+            lease.slot.opened = now;
+        }
+        return Ok(lease);
+    }
+
+    /// A slot never handed out, while any remain.
+    fn issue(borrow this) -> PoolSlot? {
+        loop {
+            let left = this.unissued.load();
+            if (left == 0) {
+                return null;
+            }
+            match (this.unissued.compareExchange(left, left - 1)) {
+                Ok(_) => { return emptySlot(); }
+                Err(_) => {}
+            }
+        }
+    }
+}
+
+/// A connection taken from a `PgPool`. Its drop returns the connection to the pool, or drops it when it cannot be
+/// reused (see `PgPool`).
+@noncopy
+public struct PgLease {
+    private slot: PoolSlot;
+    private home: Channel<PoolSlot>;
+    private lifetimeMillis: i64;
+
+    drop {
+        let now = Clock.unixMillis();
+        var back = emptySlot();
+        match (this.slot.connection.pop()) {
+            Some(c) => {
+                let old = this.lifetimeMillis > 0 && now - this.slot.opened > this.lifetimeMillis;
+                if (c.isReady() && !c.inTransaction() && !old) {
+                    match (back.connection.push(c)) {
+                        Ok() => {}
+                        Err(_) => {} // out of memory: the connection is dropped and its slot reopened on demand
+                    }
+                    back.opened = this.slot.opened;
+                    back.used = now;
+                }
+            }
+            null => {}
+        }
+        match (this.home.trySend(back)) {
+            Ok() => {}
+            Err(_) => {}
+        }
+    }
+
+    /// The leased connection.
+    public fn connection(borrow mut this) -> borrow mut PgConnection => borrow mut this.slot.connection[0];
+
+    /// Drops the connection instead of returning it to the pool, as after an error that leaves its session state in
+    /// doubt. Its slot is reopened on demand.
+    public fn discard(borrow mut this) {
+        this.slot.connection.clear();
+    }
+}

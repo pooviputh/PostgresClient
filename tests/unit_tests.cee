@@ -1,0 +1,144 @@
+// Tests that need no server: MD5, command tags, connection strings and result decoding.
+
+fn hexOf(bytes: Slice<u8>) -> String {
+    var out = String.create();
+    let digits = "0123456789abcdef";
+    for (b in bytes) {
+        out.append(digits[(b >> 4) as usize..(b >> 4) as usize + 1])!;
+        out.append(digits[(b & 15) as usize..(b & 15) as usize + 1])!;
+    }
+    return out;
+}
+
+fn md5Is(first: StringView, second: StringView, expected: StringView) -> Result<void, TestFailure> {
+    let digest = md5Of(first.bytes(), second.bytes());
+    let hex = hexOf(digest[..]);
+    return Check.isTrue(hex.view() == expected, expected);
+}
+
+@test
+fn md5KnownAnswers() -> Result<void, TestFailure> {
+    // RFC 1321 §A.5
+    md5Is("", "", "d41d8cd98f00b204e9800998ecf8427e")?;
+    md5Is("a", "bc", "900150983cd24fb0d6963f7d28e17f72")?;
+    md5Is("message ", "digest", "f96b697d7cb7938d525a2f31aaf161d0")?;
+    let long = "12345678901234567890123456789012345678901234567890123456789012345678901234567890";
+    md5Is(long, "", "57edf4a22be3c955ac49da2e2107b67a")?;
+    md5Is(long[0..40], long[40..], "57edf4a22be3c955ac49da2e2107b67a")?;
+    // Postgres's md5 password for user "md5user", password "md5_pw", salt 01 02 03 04, from Python:
+    // "md5" + md5(md5(b"md5_pwmd5user").hexdigest().encode() + bytes([1, 2, 3, 4])).hexdigest()
+    let salt = [1u8, 2, 3, 4];
+    let answer = md5Password("md5user".bytes(), "md5_pw".bytes(), salt[..]);
+    Check.isTrue(StringView.fromUtf8(answer[..])! == "md5bc2fe593422f66b87e0e529c6d7cc534", "postgres md5")?;
+    return Ok();
+}
+
+@test
+fn commandTags() -> Result<void, TestFailure> {
+    Check.equalU64(5, tagCount("INSERT 0 5\0".bytes()))?;
+    Check.equalU64(3, tagCount("UPDATE 3\0".bytes()))?;
+    Check.equalU64(100000, tagCount("SELECT 100000\0".bytes()))?;
+    Check.equalU64(0, tagCount("CREATE TABLE\0".bytes()))?;
+    Check.equalU64(0, tagCount("BEGIN\0".bytes()))?;
+    return Ok();
+}
+
+@test
+fn parsesUrls() -> Result<void, TestFailure> {
+    let config = PgConfig.parse(
+        "postgres://mail%40x:p%3Ass@db.example.org:6543/mail_db?sslmode=disable&application_name=smtp",
+    )!;
+    Check.isTrue(config.user() == "mail@x", "user")?;
+    Check.isTrue(config.password() == "p:ss", "password")?;
+    Check.isTrue(config.host() == "db.example.org", "host")?;
+    Check.equalU64(6543, config.port() as u64)?;
+    Check.isTrue(config.database() == "mail_db", "database")?;
+    Check.isTrue(config.appName() == "smtp", "application")?;
+    let v6 = PgConfig.parse("postgresql://u@[::1]:5433?sslmode=disable")!;
+    Check.isTrue(v6.host() == "::1", "v6 host")?;
+    Check.equalU64(5433, v6.port() as u64)?;
+    Check.isTrue(v6.database() == "u", "database defaults to the user")?;
+    let bare = PgConfig.parse("postgres://u@h/d?sslmode=disable")!;
+    Check.equalU64(5432, bare.port() as u64)?;
+    Check.isTrue(bare.host() == "h", "bare host")?;
+    match (PgConfig.parse("postgres://u@h:99999/d")) {
+        Ok(_) => { return Check.fail("port out of range accepted"); }
+        Err(_) => {}
+    }
+    match (PgConfig.parse("postgres://u@h/d?sslmode=sometimes")) {
+        Ok(_) => { return Check.fail("bad sslmode accepted"); }
+        Err(_) => {}
+    }
+    return Ok();
+}
+
+@test
+fn parsesKeywordStrings() -> Result<void, TestFailure> {
+    let libpq = PgConfig.parse("host=db port=5555 dbname=mail user=postfix password='a b' sslmode=disable")!;
+    Check.isTrue(libpq.host() == "db", "host")?;
+    Check.equalU64(5555, libpq.port() as u64)?;
+    Check.isTrue(libpq.database() == "mail", "dbname")?;
+    Check.isTrue(libpq.user() == "postfix", "user")?;
+    let ado = PgConfig.parse("Host=db2;Port=5556;Database=mail;Username=cosmo;Password=x y;SSL Mode=Disable;")!;
+    Check.isTrue(ado.host() == "db2", "ado host")?;
+    Check.equalU64(5556, ado.port() as u64)?;
+    Check.isTrue(ado.user() == "cosmo", "ado user")?;
+    Check.isTrue(ado.password() == "x y", "ado password")?;
+    let modes = PgConfig.parse("Server=s;User Id=u;Password=p;sslmode=verify-full")!;
+    match (modes.mode()) {
+        SslMode.VerifyFull => {}
+        _ => { return Check.fail("verify-full"); }
+    }
+    match (PgConfig.parse("host=db")) {
+        Ok(_) => { return Check.fail("a string without a user was accepted"); }
+        Err(_) => {}
+    }
+    return Ok();
+}
+
+@test
+fn decodesRows() -> Result<void, TestFailure> {
+    var rows = PgRows.create();
+    // RowDescription: 2 columns, "id" int8 and "note" text.
+    var description = Vector<u8>.create();
+    description.pushBE(2u16)!;
+    description.extend("id\0".bytes())!;
+    description.pushBE(0u32)!;
+    description.pushBE(0i16)!;
+    description.pushBE(OID_INT8)!;
+    description.pushBE(8i16)!;
+    description.pushBE(-1i32)!;
+    description.pushBE(0i16)!;
+    description.extend("note\0".bytes())!;
+    description.pushBE(0u32)!;
+    description.pushBE(0i16)!;
+    description.pushBE(OID_TEXT)!;
+    description.pushBE(-1i16)!;
+    description.pushBE(-1i32)!;
+    description.pushBE(0i16)!;
+    rows.describe(description.view())!;
+    var row = Vector<u8>.create();
+    row.pushBE(2u16)!;
+    row.pushBE(3i32)!;
+    row.extend("-42".bytes())!;
+    row.pushBE(-1i32)!;
+    rows.addRow(row.view())!;
+    Check.equalU64(1, rows.rowCount() as u64)?;
+    Check.equalU64(2, rows.columnCount() as u64)?;
+    Check.isTrue(rows.columnName(1) == "note", "name")?;
+    Check.equalU64(1, rows.columnIndex("note")! as u64)?;
+    Check.isTrue(rows.columnIndex("missing") == null, "missing column")?;
+    Check.isTrue(rows.int64(0, 0)! == -42, "int")?;
+    Check.isTrue(rows.isNull(0, 1), "null")?;
+    Check.isTrue(rows.text(0, 1) == null, "null text")?;
+    // A cell running past the message is a protocol error.
+    var bad = Vector<u8>.create();
+    bad.pushBE(2u16)!;
+    bad.pushBE(10i32)!;
+    bad.extend("1".bytes())!;
+    match (rows.addRow(bad.view())) {
+        Ok() => { return Check.fail("a short DataRow was accepted"); }
+        Err(_) => {}
+    }
+    return Ok();
+}

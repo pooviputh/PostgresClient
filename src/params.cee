@@ -1,0 +1,118 @@
+// Type OIDs (`pg_type.oid`) of common types, for `PgParams.textAs` and `PgRows.columnType`.
+public const OID_BOOL: u32 = 16;
+public const OID_BYTEA: u32 = 17;
+public const OID_INT8: u32 = 20;
+public const OID_INT2: u32 = 21;
+public const OID_INT4: u32 = 23;
+public const OID_TEXT: u32 = 25;
+public const OID_JSON: u32 = 114;
+public const OID_FLOAT4: u32 = 700;
+public const OID_FLOAT8: u32 = 701;
+public const OID_VARCHAR: u32 = 1043;
+public const OID_DATE: u32 = 1082;
+public const OID_TIMESTAMP: u32 = 1114;
+public const OID_TIMESTAMPTZ: u32 = 1184;
+public const OID_NUMERIC: u32 = 1700;
+public const OID_UUID: u32 = 2950;
+public const OID_JSONB: u32 = 3802;
+/// No type given: the server infers it from the query, as for a quoted literal.
+public const OID_UNKNOWN: u32 = 0;
+
+const FORMAT_TEXT: u16 = 0;
+const FORMAT_BINARY: u16 = 1;
+const MAX_PARAMETERS: usize = 65535;
+const MAX_VALUE: usize = 0x7FFFFFFF;
+
+/// The values for a query's `$1`, `$2`, … placeholders, in order, already encoded for the Bind message.
+///
+/// Text goes as text with no declared type, so the server types it from the query, exactly as it would a quoted
+/// literal. Numbers, booleans and byte strings go in binary with their type, so they are never formatted or parsed
+/// as text. A `PgParams` can be `clear`ed and reused, which keeps its buffers.
+@noncopy
+public struct PgParams {
+    private types: Vector<u32>;
+    private formats: Vector<u16>;
+    /// Each value as Bind wants it: a 32-bit big-endian length (-1 for NULL), then the bytes.
+    private values: Vector<u8>;
+
+    public fn create() -> PgParams => PgParams {
+        types: Vector<u32>.create(),
+        formats: Vector<u16>.create(),
+        values: Vector<u8>.create(),
+    };
+
+    /// How many values have been added.
+    public fn count(borrow this) -> usize => this.types.length;
+
+    /// Removes every value, keeping the memory.
+    public fn clear(borrow mut this) {
+        this.types.clear();
+        this.formats.clear();
+        this.values.clear();
+    }
+
+    fn start(borrow mut this, oid: u32, format: u16, length: usize) -> Result<void, PgError> {
+        if (this.types.length >= MAX_PARAMETERS || length > MAX_VALUE) {
+            return Err(PgError.TooLarge);
+        }
+        allocated(this.types.push(oid))?;
+        allocated(this.formats.push(format))?;
+        allocated(this.values.pushBE(truncate<i32>(length)))?;
+        return Ok();
+    }
+
+    /// Text, typed by the server from the query (so it also serves for dates, numerics, UUIDs, enums, …).
+    public fn text(borrow mut this, value: StringView) -> Result<void, PgError> =>
+        this.textAs(value, OID_UNKNOWN);
+
+    /// Text declared as type `oid` (an `OID_` constant, or any OID), for when the query does not fix the type, as in
+    /// `SELECT $1`.
+    public fn textAs(borrow mut this, value: StringView, oid: u32) -> Result<void, PgError> {
+        this.start(oid, FORMAT_TEXT, value.length)?;
+        return allocated(this.values.extend(value.bytes()));
+    }
+
+    /// A `bigint`. The server converts it where the column is `integer` or `smallint`, and fails if it does not fit.
+    public fn int64(borrow mut this, value: i64) -> Result<void, PgError> {
+        this.start(OID_INT8, FORMAT_BINARY, 8)?;
+        return allocated(this.values.pushBE(value));
+    }
+
+    /// An `integer`.
+    public fn int32(borrow mut this, value: i32) -> Result<void, PgError> {
+        this.start(OID_INT4, FORMAT_BINARY, 4)?;
+        return allocated(this.values.pushBE(value));
+    }
+
+    /// A `double precision`.
+    public fn float64(borrow mut this, value: f64) -> Result<void, PgError> {
+        this.start(OID_FLOAT8, FORMAT_BINARY, 8)?;
+        return allocated(this.values.pushBE(value.bits()));
+    }
+
+    /// A `boolean`.
+    public fn bool(borrow mut this, value: bool) -> Result<void, PgError> {
+        this.start(OID_BOOL, FORMAT_BINARY, 1)?;
+        return allocated(this.values.pushBE(if (value) 1u8 else 0u8));
+    }
+
+    /// A `bytea`, sent as raw bytes (no hex or escaping).
+    public fn bytes(borrow mut this, value: Slice<u8>) -> Result<void, PgError> {
+        this.start(OID_BYTEA, FORMAT_BINARY, value.length)?;
+        return allocated(this.values.extend(value));
+    }
+
+    /// SQL NULL, typed by the server from the query.
+    public fn sqlNull(borrow mut this) -> Result<void, PgError> {
+        if (this.types.length >= MAX_PARAMETERS) {
+            return Err(PgError.TooLarge);
+        }
+        allocated(this.types.push(OID_UNKNOWN))?;
+        allocated(this.formats.push(FORMAT_TEXT))?;
+        return allocated(this.values.pushBE(-1i32));
+    }
+
+    fn typeList(borrow this) -> Slice<u32> => this.types.view();
+    fn formatList(borrow this) -> Slice<u16> => this.formats.view();
+    fn encoded(borrow this) -> Slice<u8> => this.values.view();
+}

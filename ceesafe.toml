@@ -1,0 +1,10 @@
+[package]
+name = "postgres"
+version = "0.1.0"
+kind = "library"
+tests = ["tests"]
+
+[dependencies]
+sha256 = { path = "../../CeeSafeLibs/sha256" }
+encoding = { path = "../../CeeSafeLibs/encoding" }
+tls = { path = "../../CeeSafeLibs/tls" }
