@@ -136,4 +136,5 @@ forwarding, at about 0.33 ms per round trip, is the limit there, not either clie
 
 ## License
 
-PostgresClient is licensed under the GNU General Public License, version 2 only ([COPYING](COPYING)).
+PostgresClient is licensed under the GNU General Public License, version 2 only ([COPYING](COPYING)),
+with an exception that permits linking with OpenSSL ([COPYING.OPENSSL](COPYING.OPENSSL)).
