@@ -133,3 +133,7 @@ forwarding, at about 0.33 ms per round trip, is the limit there, not either clie
 
 `examples/query` runs one statement from the command line:
 `./out/query "postgres://cee:cee_test_pw@127.0.0.1:55432/ceetest" "SELECT now()"`.
+
+## License
+
+PostgresClient is licensed under the GNU General Public License, version 2 only ([COPYING](COPYING)).
